@@ -39,8 +39,19 @@ def scenario_for_viewer(
         'scenes': [],
         'roles': [],
     }
+    known = set(revealed_ids or ())
+    hidden_scenes = {
+        scene.id
+        for scene in scenario.scenes
+        if not is_keeper
+        and scene.conditions.get('participants')
+        and role_id not in scene.conditions['participants']
+    }
     for scene in scenario.scenes:
         if scene_id and scene.id != scene_id:
+            continue
+        participants = scene.conditions.get('participants', [])
+        if not is_keeper and participants and role_id not in participants:
             continue
         item = {'id': scene.id, 'title': scene.title}
         item['public_text'] = scene.public_text
@@ -62,6 +73,9 @@ def scenario_for_viewer(
         for content in getattr(scenario, category):
             if not is_visible(content, role_id, is_keeper, revealed_ids):
                 continue
+            if content.id not in known and content.scene_ids:
+                if set(content.scene_ids) <= hidden_scenes:
+                    continue
             if scene_id and content.scene_ids:
                 if scene_id not in content.scene_ids:
                     continue
@@ -85,9 +99,15 @@ def scenario_for_viewer(
                 for node in asset.nodes
                 if is_visible(node, role_id, is_keeper, revealed_ids)
             ],
+            'regions': asset.regions if is_keeper else [],
         }
         for asset in scenario.assets
         if is_visible(asset, role_id, is_keeper, revealed_ids)
+        and (
+            asset.id in known
+            or not asset.scene_ids
+            or not set(asset.scene_ids) <= hidden_scenes
+        )
         and (
             not scene_id or not asset.scene_ids or scene_id in asset.scene_ids
         )

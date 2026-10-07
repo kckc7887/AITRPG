@@ -6,6 +6,8 @@ from pathlib import Path
 from threading import RLock
 from typing import Any
 
+from alembic import command
+from alembic.config import Config
 from sqlalchemy import JSON
 from sqlalchemy import Boolean
 from sqlalchemy import Integer
@@ -13,6 +15,7 @@ from sqlalchemy import String
 from sqlalchemy import UniqueConstraint
 from sqlalchemy import create_engine
 from sqlalchemy import func
+from sqlalchemy import inspect
 from sqlalchemy import select
 from sqlalchemy.orm import DeclarativeBase
 from sqlalchemy.orm import Mapped
@@ -176,7 +179,19 @@ class Store:
         with self.engine.connect() as connection:
             connection.exec_driver_sql('PRAGMA journal_mode=WAL')
             connection.exec_driver_sql('PRAGMA foreign_keys=ON')
-        Base.metadata.create_all(self.engine)
+        migration_dir = Path(__file__).parents[1] / 'migrations'
+        if not migration_dir.exists():
+            migration_dir = Path(__file__).parents[3] / 'migrations'
+        config = Config()
+        config.set_main_option('script_location', str(migration_dir))
+        with self.engine.begin() as connection:
+            config.attributes['connection'] = connection
+            schema = inspect(connection)
+            if schema.has_table('documents') and not schema.has_table(
+                'alembic_version'
+            ):
+                command.stamp(config, '0001')
+            command.upgrade(config, 'head')
 
     @contextmanager
     def transaction(self):

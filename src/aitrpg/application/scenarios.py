@@ -189,7 +189,11 @@ def _normalize_terminal_links(scenario: Scenario) -> None:
 
 
 def _ending_code(text: str) -> str:
-    match = re.match(r'^结局\s*([A-Fa-f]|[Xx][_-]\d+)(?:\s|[：:]|$)', text)
+    match = re.match(
+        r'^结局\s*([A-Za-z](?:[_-]\d+)?|\d+|[一二三四五六七八九十]+)'
+        r'(?:\s|[：:]|$)',
+        text,
+    )
     return match[1].upper().replace('_', '-') if match else ''
 
 
@@ -361,7 +365,77 @@ def _validate_structure(scenario: Scenario) -> list[ReviewIssue]:
             issues.append(
                 ReviewIssue(message=f'{asset.id}：{error}', severity='blocker')
             )
+    for scene in scenario.scenes:
+        participants = scene.conditions.get('participants', [])
+        if not isinstance(participants, list) or not all(
+            isinstance(value, str) and value in role_ids
+            for value in participants
+        ):
+            issues.append(
+                ReviewIssue(
+                    message=f'{scene.id} 的参与角色标识无效',
+                    severity='blocker',
+                )
+            )
+    if scenario.ruleset != 'coc7':
+        issues.append(
+            ReviewIssue(
+                message='此版仅支持 coc7 规则，不能按其他规则开启游戏',
+                severity='blocker',
+            )
+        )
     return issues
+
+
+def _normalize_scene_participants(scenario: Scenario) -> None:
+    roles = {
+        re.sub(r'[_-]', '', role.id.lower()): role.id
+        for role in scenario.roles
+    }
+    table_scopes = {}
+    for block in scenario.source_blocks:
+        restriction = re.search(
+            r'这个部分只有(.+?)可参与', block.text, re.IGNORECASE
+        )
+        table = re.match(r'table:\d+', block.locator)
+        if restriction and table:
+            participants = [
+                roles.get('ho' + number)
+                for number in re.findall(
+                    r'ho\s*(\d+)', restriction[1], re.IGNORECASE
+                )
+            ]
+            if participants and all(participants):
+                table_scopes[(block.file, table[0])] = participants
+    source_scopes = {}
+    for block in scenario.source_blocks:
+        table = re.match(r'table:\d+', block.locator)
+        if table and (block.file, table[0]) in table_scopes:
+            source_scopes[block.id] = table_scopes[(block.file, table[0])]
+    for scene in scenario.scenes:
+        solo = re.match(
+            r'^HO\s*(\d+)\s*(?:导入|间章)', scene.title, re.IGNORECASE
+        )
+        scopes = {
+            tuple(source_scopes[identity])
+            for identity in scene.source_ids
+            if identity in source_scopes
+        }
+        participants = None
+        if solo and 'ho' + solo[1] in roles:
+            participants = [roles['ho' + solo[1]]]
+        elif solo:
+            scenario.review_issues.append(
+                ReviewIssue(
+                    message=f'{scene.title} 未定义对应的 HO，不能猜测参与角色',
+                    severity='blocker',
+                    source_ids=scene.source_ids,
+                )
+            )
+        elif len(scopes) == 1:
+            participants = list(next(iter(scopes)))
+        if participants:
+            scene.conditions['participants'] = participants
 
 
 def _region_shapes(asset: ScenarioAsset) -> list[dict[str, Any]]:
@@ -560,6 +634,7 @@ class ScenarioService:
                 )
             _normalize_source_endings(scenario)
             _normalize_terminal_links(scenario)
+            _normalize_scene_participants(scenario)
             if provider_id:
                 await self._repair_navigation(scenario, provider_id)
             scenario.review_issues.extend(_validate_structure(scenario))

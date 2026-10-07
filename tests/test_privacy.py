@@ -130,6 +130,28 @@ def test_source_retrieval_uses_keeper_scope_and_relevance():
     assert found[0]['is_truncated']
 
 
+def test_solo_scene_read_aloud_stays_with_its_participant():
+    scenario = Scenario(
+        title='单人间章',
+        scenes=[
+            ScenarioScene(
+                id='solo',
+                title='HO1间章',
+                public_text='你在师兄房中发现私信。',
+                conditions={'participants': ['ho1']},
+            )
+        ],
+    )
+    own = json.dumps(
+        scenario_for_viewer(scenario, role_id='ho1'), ensure_ascii=False
+    )
+    other = json.dumps(
+        scenario_for_viewer(scenario, role_id='ho2'), ensure_ascii=False
+    )
+    assert '师兄房中发现私信' in own
+    assert '师兄房中发现私信' not in other
+
+
 def test_map_fog_hides_pixels_and_role_reveal_isolated(tmp_path: Path):
     store = Store(tmp_path / 'state.db')
     service = ScenarioService(store, None, tmp_path / 'data')

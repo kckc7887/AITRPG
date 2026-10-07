@@ -18,6 +18,14 @@ def migrate():
         with context.begin_transaction():
             context.run_migrations()
         return
+    connection = CONFIG.attributes.get('connection')
+    if connection is not None:
+        context.configure(
+            connection=connection, target_metadata=TARGET_METADATA
+        )
+        with context.begin_transaction():
+            context.run_migrations()
+        return
     engine = engine_from_config(
         CONFIG.get_section(CONFIG.config_ini_section),
         prefix='sqlalchemy.',

@@ -33,9 +33,14 @@ dev = [
 
 [project.scripts]
 aitrpg = "aitrpg.cli:main"
+aitrpg-agent = "aitrpg.agent:main"
+aitrpg-bridge = "aitrpg.bridge:main"
 
 [tool.hatch.build.targets.wheel]
 packages = ["src/aitrpg"]
+
+[tool.hatch.build.targets.wheel.force-include]
+"migrations" = "aitrpg/migrations"
 
 [tool.ruff]
 line-length = 79

@@ -109,6 +109,10 @@ def register_api(app: FastAPI, platform: Platform):
     def import_character(request: CharacterImport):
         return platform.characters.import_xlsx(request.path, request.actor_id)
 
+    @app.post('/api/v1/characters/{character_id}/clone')
+    def clone_character(character_id: str):
+        return platform.characters.clone(character_id)
+
     @app.get('/api/v1/scenarios')
     def scenarios():
         return platform.scenarios.list()
@@ -150,6 +154,10 @@ def register_api(app: FastAPI, platform: Platform):
     @app.post('/api/v1/games/{game_id}/pause')
     async def pause_game(game_id: str):
         return await platform.pause_game(game_id)
+
+    @app.post('/api/v1/games/{game_id}/finish')
+    async def finish_game(game_id: str):
+        return await platform.games.finish(game_id)
 
     @app.post('/api/v1/games/{game_id}/intervene')
     async def intervene(game_id: str, request: Intervention):

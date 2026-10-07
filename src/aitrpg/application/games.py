@@ -1,9 +1,11 @@
 from __future__ import annotations
 
 import asyncio
+import base64
 import hashlib
 import json
 import math
+import mimetypes
 import secrets
 from datetime import timedelta
 from pathlib import Path
@@ -49,6 +51,8 @@ KEEPER_INSTRUCTION = (
     '公开narration不能包含主持专用资料、非现场角色的秘密或私密判定。'
     '命令参数：damage(amount,armor=0)、sanity(success_loss,failure_loss)、'
     'heal(source=first_aid或medicine,wound_id可选)、'
+    '治疗别人时附healer_id，使用治疗者真实技能；heal只操作调查员卡。'
+    'NPC治疗申请医生check医学，再用flags记录主持裁定的NPC后果。'
     'recover(hours=0,days=0)、grow(skills列表)、'
     'spend_mp(amount)、condition(name,is_present布尔)、'
     'add_item(item对象)、remove_item(item_id)、mark_skill(skill)、'
@@ -356,6 +360,32 @@ class GameService:
                             item[key] = item[key][:6000]
         if extra:
             context.update(extra)
+        actor = self.store.get('actor', actor_id)
+        provider_data = (
+            self.store.get('provider', actor.get('provider_id'))
+            if actor and actor.get('provider_id')
+            else None
+        )
+        if provider_data and provider_data.get('is_vision'):
+            scenario = self.scenario(game)
+            visible_ids = {asset['id'] for asset in context['assets']}
+            relevant = [
+                asset
+                for asset in scenario.assets
+                if asset.id in visible_ids
+                and asset.is_map
+                and (not asset.scene_ids or game.scene_id in asset.scene_ids)
+            ]
+            if relevant:
+                path = self.asset_path(game.id, relevant[0].id, actor_id)
+                media_type = mimetypes.guess_type(path.name)[0] or 'image/png'
+                context['_images'] = [
+                    {
+                        'url': f'data:{media_type};base64,'
+                        + base64.b64encode(path.read_bytes()).decode('ascii'),
+                        'caption': relevant[0].name,
+                    }
+                ]
         return context
 
     def _cycle(self, game: Game):
@@ -979,11 +1009,17 @@ class GameService:
             self._validate_card_state(card)
             rolls, details = [], {'authority': '主持裁定', 'changes': changes}
         else:
+            healer = None
+            if command.kind == 'heal' and command.parameters.get('healer_id'):
+                healer = cards.get(command.parameters['healer_id'])
+                if healer is None:
+                    raise ValueError('治疗者不在游戏中')
             card, rolls, details = apply_command(
                 card,
                 command.kind,
                 command.parameters,
                 day=game.scheduler.get('base_day', 0) + game.day,
+                healer=healer,
             )
         cards[card.id] = card
         for roll in rolls:
@@ -992,7 +1028,7 @@ class GameService:
                     'kind': 'check',
                     'data': {
                         **roll.model_dump(mode='json'),
-                        'character_id': card.id,
+                        'character_id': roll.details.get('healer_id', card.id),
                     },
                     'is_private': command.is_private,
                 }

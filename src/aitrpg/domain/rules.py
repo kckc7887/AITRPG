@@ -789,11 +789,26 @@ def _sanity(
 
 
 def _heal(
-    character: Character, parameters: dict, rng: Any, rolls: list[Roll]
+    character: Character,
+    parameters: dict,
+    rng: Any,
+    rolls: list[Roll],
+    healer: Character | None = None,
 ) -> dict:
     source = parameters.get('source', 'first_aid')
     if source not in ('first_aid', 'medicine'):
         raise ValueError('治疗来源须为first_aid或medicine')
+    clinician = healer if healer is not None else character
+    if any(
+        state in clinician.conditions
+        for state in ('dead', 'unconscious', 'dying', 'permanent_insanity')
+    ):
+        raise ValueError('治疗者当前无法行动')
+    attribution = {
+        'healer_id': clinician.id,
+        'patient_id': character.id,
+        'source': source,
+    }
     wounds = _runtime(character).setdefault('wounds', [])
     if not wounds:
         wounds.append({'id': 'imported', 'damage': 0, 'attempts': []})
@@ -805,27 +820,29 @@ def _heal(
         raise ValueError('同一伤口不能重复进行相同治疗')
     wound['attempts'].append(source)
     check = skill_check(
-        character, '急救' if source == 'first_aid' else '医学', rng=rng
+        clinician, '急救' if source == 'first_aid' else '医学', rng=rng
     )
+    check.details.update(attribution)
     rolls.append(check)
     if not check.details['is_success']:
-        return {'healed': 0, 'source': source}
+        return {'healed': 0, **attribution}
     if 'dying' in character.conditions or 'stabilized' in character.conditions:
         _condition(character, 'dying', False)
         _condition(character, 'stabilized', True)
         if source == 'medicine':
             _condition(character, 'medical_treatment', True)
-        return {'healed': 0, 'source': source, 'is_stabilized': True}
+        return {'healed': 0, 'is_stabilized': True, **attribution}
     amount = 1
     if source == 'medicine':
         healing = roll_dice('1D3', rng=rng)
+        healing.details.update(attribution)
         rolls.append(healing)
         amount = healing.total
     before = character.current_hp
     character.current_hp = min(character.max_hp, before + amount)
     if character.current_hp > 0:
         _condition(character, 'unconscious', False)
-    return {'healed': character.current_hp - before, 'source': source}
+    return {'healed': character.current_hp - before, **attribution}
 
 
 def _recover(
@@ -891,6 +908,7 @@ def apply_command(
     *,
     day: int = 0,
     rng: Any = None,
+    healer: Character | None = None,
 ) -> tuple[Character, list[Roll], dict]:
     updated = character.model_copy(deep=True)
     rolls = []
@@ -907,7 +925,7 @@ def apply_command(
     elif kind in ('sanity', 'san'):
         info.update(_sanity(updated, parameters, day, rng, rolls))
     elif kind == 'heal':
-        info.update(_heal(updated, parameters, rng, rolls))
+        info.update(_heal(updated, parameters, rng, rolls, healer))
     elif kind == 'recover':
         info.update(_recover(updated, parameters, rng, rolls))
     elif kind == 'dying_check':

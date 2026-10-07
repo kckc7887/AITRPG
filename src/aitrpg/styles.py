@@ -12,7 +12,7 @@ body, .q-field, .q-btn {
   font-family: 'Microsoft YaHei UI', 'PingFang SC', sans-serif;
 }
 .q-header { background: var(--ink); color: var(--paper); }
-.q-header .q-btn { color: var(--paper); }
+.q-header .q-btn, .q-header a { color: var(--paper) !important; }
 .q-page-container { padding-top: 68px !important; }
 .q-page { min-height: calc(100vh - 68px) !important; }
 .q-card { box-shadow: none; border: 1px solid var(--line); }

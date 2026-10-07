@@ -22,6 +22,7 @@ from aitrpg.application.scenarios import LinkCorrection
 from aitrpg.application.scenarios import NavigationCorrections
 from aitrpg.application.scenarios import ScenarioDraft
 from aitrpg.application.scenarios import ScenarioService
+from aitrpg.application.scenarios import _normalize_scene_participants
 from aitrpg.application.scenarios import _normalize_source_endings
 from aitrpg.application.scenarios import _normalize_terminal_links
 from aitrpg.domain.models import Provider
@@ -78,6 +79,35 @@ def test_source_ending_list_keeps_transitions_out_of_terminal_catalog():
     assert scenario.endings[0].text == '结局A\n调查员平安离开。'
     assert any('第二章还有后续' in item.text for item in scenario.handouts)
     assert all(item.visibility == 'keeper' for item in scenario.handouts)
+
+
+def test_explicit_solo_and_split_party_source_scope_survives_import():
+    first = SourceBlock(
+        file='story.docx',
+        locator='table:17:row:1:cell:1',
+        text='这个部分只有ho1、ho3可参与。',
+    )
+    second = SourceBlock(
+        file='story.docx',
+        locator='table:17:row:1:cell:2:chars:6000-8000',
+        text='深处的私密房间。',
+    )
+    scenario = Scenario(
+        title='分队',
+        source_blocks=[first, second],
+        roles=[
+            ScenarioRole(id='ho1', name='一'),
+            ScenarioRole(id='ho2', name='二'),
+            ScenarioRole(id='ho3', name='三'),
+        ],
+        scenes=[
+            ScenarioScene(id='solo', title='HO2间章：私下谈话'),
+            ScenarioScene(id='cave', title='洞穴深处', source_ids=[second.id]),
+        ],
+    )
+    _normalize_scene_participants(scenario)
+    assert scenario.scenes[0].conditions['participants'] == ['ho2']
+    assert scenario.scenes[1].conditions['participants'] == ['ho1', 'ho3']
 
 
 def test_metadata_can_arrive_after_preceding_portrait_chunks():
