@@ -13,3 +13,8 @@ dist/
 .env
 .env.*
 !.env.example
+data/
+artifacts/
+*.sqlite3
+*.sqlite3-*
+.playwright/
