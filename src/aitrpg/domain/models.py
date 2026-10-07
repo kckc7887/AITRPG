@@ -217,6 +217,7 @@ class Game(Entity):
     budget_nodes: int = Field(default=1000, ge=1)
     budget_tokens: int = Field(default=10000000, ge=1000)
     day: int = 0
+    hour: float = Field(default=8, ge=0, lt=24)
     flags: dict[str, Any] = Field(default_factory=dict)
     knowledge: dict[str, list[str]] = Field(default_factory=dict)
     revealed_assets: dict[str, list[str]] = Field(default_factory=dict)
@@ -255,6 +256,7 @@ class Invitation(Entity):
 class PlayerResponse(Model):
     speech: str = Field(default='', max_length=4000)
     intent: str = Field(default='', max_length=4000)
+    intent_visibility: Literal['keeper', 'public'] = 'keeper'
     is_pass: bool = False
     defense: Literal['dodge', 'fight_back', 'cover'] | None = None
     defense_weapon_index: int | None = Field(default=None, ge=0)
@@ -296,6 +298,7 @@ class KeeperResponse(Model):
     recipient_actor_ids: list[str] = Field(default_factory=list)
     flags: dict[str, Any] = Field(default_factory=dict)
     advance_days: int = Field(default=0, ge=0, le=365)
+    advance_hours: float = Field(default=0, ge=0, le=8760)
     is_finished: bool = False
     ending: str = ''
     improvisation: str = ''

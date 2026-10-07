@@ -1,5 +1,7 @@
 from __future__ import annotations
 
+import hashlib
+import secrets
 from pathlib import Path
 
 from pydantic import BaseModel
@@ -156,6 +158,22 @@ class Platform:
 
     def issue_agent_token(self, game_id, actor_id):
         return self.games.issue_token(game_id, actor_id)
+
+    def issue_actor_token(self, actor_id):
+        if not self.store.get('actor', actor_id):
+            raise ValueError('AI 身份不存在')
+        token = secrets.token_urlsafe(32)
+        digest = hashlib.sha256(token.encode()).hexdigest()
+        self.store.put(
+            'agent_token',
+            digest,
+            {
+                'actor_id': actor_id,
+                'game_id': None,
+                'is_revoked': False,
+            },
+        )
+        return token
 
     def resolve_upload(self, name: str) -> Path:
         destination = self.settings.data_dir / 'incoming'

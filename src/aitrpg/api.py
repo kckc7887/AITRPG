@@ -1,5 +1,6 @@
 from fastapi import FastAPI
 from fastapi import HTTPException
+from fastapi.responses import FileResponse
 from pydantic import Field
 
 from aitrpg.application.platform import Platform
@@ -7,6 +8,8 @@ from aitrpg.domain.models import Actor
 from aitrpg.domain.models import Character
 from aitrpg.domain.models import Model
 from aitrpg.domain.models import Provider
+from aitrpg.domain.models import Scenario
+from aitrpg.domain.models import Seat
 
 
 class CharacterGeneration(Model):
@@ -18,6 +21,36 @@ class CharacterGeneration(Model):
 class CharacterImport(Model):
     actor_id: str
     path: str
+
+
+class ScenarioImport(Model):
+    path: str
+    provider_id: str | None = None
+
+
+class GameCreation(Model):
+    name: str
+    scenario_id: str
+    keeper_actor_id: str
+    seats: list[Seat]
+    budget_nodes: int = 1000
+    budget_tokens: int = 10000000
+
+
+class Intervention(Model):
+    text: str
+    character_id: str | None = None
+    patch: dict | None = None
+
+
+class BudgetChange(Model):
+    budget_nodes: int = Field(ge=1)
+    budget_tokens: int = Field(ge=1000)
+
+
+class MapChange(Model):
+    positions: dict = Field(default_factory=dict)
+    revealed_regions: dict[str, list[str]] = Field(default_factory=dict)
 
 
 def register_api(app: FastAPI, platform: Platform):
@@ -75,3 +108,66 @@ def register_api(app: FastAPI, platform: Platform):
     @app.post('/api/v1/characters/import')
     def import_character(request: CharacterImport):
         return platform.characters.import_xlsx(request.path, request.actor_id)
+
+    @app.get('/api/v1/scenarios')
+    def scenarios():
+        return platform.scenarios.list()
+
+    @app.post('/api/v1/scenarios/import')
+    async def import_scenario(request: ScenarioImport):
+        return await platform.scenarios.import_path(
+            request.path, request.provider_id
+        )
+
+    @app.post('/api/v1/scenarios')
+    def save_scenario(scenario: Scenario):
+        return platform.scenarios.save(scenario)
+
+    @app.post('/api/v1/scenarios/{scenario_id}/approve')
+    def approve_scenario(scenario_id: str):
+        return platform.scenarios.approve(scenario_id)
+
+    @app.get('/api/v1/games')
+    def games():
+        return platform.list_games()
+
+    @app.post('/api/v1/games')
+    def create_game(request: GameCreation):
+        return platform.create_game(**request.model_dump())
+
+    @app.get('/api/v1/games/{game_id}')
+    def game_view(game_id: str, actor_id: str | None = None):
+        return platform.get_game_view(game_id, actor_id)
+
+    @app.post('/api/v1/games/{game_id}/run')
+    async def run_game(game_id: str):
+        return await platform.run_game(game_id)
+
+    @app.post('/api/v1/games/{game_id}/step')
+    async def step_game(game_id: str):
+        return await platform.step_game(game_id)
+
+    @app.post('/api/v1/games/{game_id}/pause')
+    async def pause_game(game_id: str):
+        return await platform.pause_game(game_id)
+
+    @app.post('/api/v1/games/{game_id}/intervene')
+    async def intervene(game_id: str, request: Intervention):
+        return await platform.intervene(game_id, **request.model_dump())
+
+    @app.post('/api/v1/games/{game_id}/budget')
+    def update_budget(game_id: str, request: BudgetChange):
+        return platform.games.update_budget(game_id, **request.model_dump())
+
+    @app.post('/api/v1/games/{game_id}/maps/{asset_id}')
+    def update_map(game_id: str, asset_id: str, request: MapChange):
+        return platform.games.update_map(
+            game_id, asset_id, **request.model_dump()
+        )
+
+    @app.get('/api/v1/games/{game_id}/assets/{asset_id}')
+    def asset(game_id: str, asset_id: str, actor_id: str | None = None):
+        path = platform.games.asset_path(game_id, asset_id, actor_id)
+        return FileResponse(
+            path, headers={'Cache-Control': 'private, no-store'}
+        )

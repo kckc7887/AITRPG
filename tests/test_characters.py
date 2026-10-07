@@ -5,7 +5,9 @@ from types import SimpleNamespace
 import pytest
 from openpyxl import Workbook
 
+import aitrpg.application.characters as characters_module
 from aitrpg.adapters.cards import import_character_xlsx
+from aitrpg.adapters.storage import Transaction
 from aitrpg.application.characters import CharacterAllocation
 from aitrpg.application.characters import CharacterConcept
 from aitrpg.application.characters import CharacterService
@@ -282,10 +284,313 @@ async def test_generation_corrects_invalid_allocation_without_changing_dice(
     platform.save_actor(actor)
     service = platform.characters
     character = await service.generate('actor', '上海少年古董商')
-    assert client.calls == 3
-    assert client.budgets == [220, 220]
+    assert client.calls == 2
+    assert client.budgets == [220]
     assert character.attributes['SIZ'] == 55
     assert character.attributes['EDU'] == 55
     assert character.max_hp == 11
-    assert character.skills['图书馆使用'] == 70
+    assert character.skills['图书馆使用'] == 73
+    assert sum(character.allocations['occupational'].values()) == 220
+    assert sum(character.allocations['interests'].values()) == 120
+    assert character.allocations['allocation_adjustments']
     assert service.get(character.id).name == '少年古董商'
+
+
+def prepared_platform(tmp_path, monkeypatch):
+    class Dice:
+        def randint(self, minimum, maximum):
+            return 4 if maximum == 6 else 10
+
+    monkeypatch.setattr('aitrpg.domain.rules.random.SystemRandom', Dice)
+    platform = Platform(Settings(data_dir=tmp_path / 'draft-platform'))
+    for actor_id in ('owner', 'other'):
+        platform.save_actor(
+            Actor(id=actor_id, name=actor_id, connection='mcp')
+        )
+    return platform
+
+
+def card_from_draft(draft):
+    character = make_character(actor_id=draft['actor_id'])
+    for name in (
+        'attributes',
+        'age',
+        'luck',
+        'max_hp',
+        'max_mp',
+        'max_san',
+        'current_hp',
+        'current_mp',
+        'current_san',
+        'movement',
+        'damage_bonus',
+        'build',
+    ):
+        setattr(character, name, deepcopy(draft[name]))
+    character.allocations['occupational'] = {
+        '信用评级': 30,
+        '会计': 35,
+        '估价': 35,
+        '汽车驾驶': 30,
+        '历史': 30,
+        '图书馆使用': 30,
+        '导航': 30,
+        '取悦': 30,
+        '说服': 30,
+    }
+    character.allocations['interests'] = {
+        '图书馆使用': 20,
+        '侦查': 40,
+        '聆听': 40,
+        '潜行': 40,
+    }
+    character.skills = validate_allocations(
+        character.attributes,
+        character.occupation_definition,
+        character.allocations['selected_skills'],
+        character.allocations['occupational'],
+        character.allocations['interests'],
+    )
+    return character
+
+
+def test_prepare_reuses_draw_and_requires_explicit_age_reductions(
+    tmp_path,
+    monkeypatch,
+):
+    platform = prepared_platform(tmp_path, monkeypatch)
+    first = platform.characters.prepare('owner')
+    second = platform.characters.prepare('owner')
+    assert first['draft_id'] == second['draft_id']
+    assert first['max_hp'] == 13
+    assert first['attributes']['EDU'] == 70
+    assert first['luck'] == 60
+    with pytest.raises(ValueError, match='age_reductions'):
+        platform.characters.prepare('owner', age=15)
+    assert len(platform.store.list('creation_draft')) == 1
+
+
+def test_finalise_rejects_owner_or_attribute_forgery_and_consumes_once(
+    tmp_path,
+    monkeypatch,
+):
+    platform = prepared_platform(tmp_path, monkeypatch)
+    draft = platform.characters.prepare('owner')
+    character = card_from_draft(draft)
+    with pytest.raises(ValueError, match='不属于'):
+        platform.characters.finalise_draft(
+            'other', draft['draft_id'], character
+        )
+    forged = character.model_copy(deep=True)
+    forged.attributes['STR'] += 1
+    with pytest.raises(ValueError, match='attributes'):
+        platform.characters.finalise_draft('owner', draft['draft_id'], forged)
+    saved = platform.characters.finalise_draft(
+        'owner', draft['draft_id'], character
+    )
+    assert saved.attributes['STR'] == 60
+    assert saved.current_hp == 13
+    assert platform.characters.get(saved.id).name == character.name
+    replacement = character.model_copy(update={'id': 'another-card'})
+    with pytest.raises(ValueError, match='重复消费'):
+        platform.characters.finalise_draft(
+            'owner', draft['draft_id'], replacement
+        )
+    assert platform.store.get('character', 'another-card') is None
+
+
+def test_draft_consumption_and_character_save_roll_back_together(
+    tmp_path,
+    monkeypatch,
+):
+    platform = prepared_platform(tmp_path, monkeypatch)
+    draft = platform.characters.prepare('owner')
+    character = card_from_draft(draft)
+    original_put = Transaction.put
+
+    def failing_put(transaction, kind, identifier, body, **kwargs):
+        if kind == 'creation_draft' and body['is_consumed']:
+            raise RuntimeError('模拟写入草稿消费失败')
+        return original_put(transaction, kind, identifier, body, **kwargs)
+
+    monkeypatch.setattr(Transaction, 'put', failing_put)
+    with pytest.raises(RuntimeError, match='消费失败'):
+        platform.characters.finalise_draft(
+            'owner', draft['draft_id'], character
+        )
+    assert platform.store.get('character', character.id) is None
+    assert not platform.store.get('creation_draft', draft['draft_id'])[
+        'is_consumed'
+    ]
+
+
+def generation_platform(tmp_path, client):
+    platform = Platform(Settings(data_dir=tmp_path / 'generation'), client)
+    provider = platform.save_provider(
+        Provider(
+            id='generator-provider',
+            name='生成模型',
+            base_url='https://example.test',
+        )
+    )
+    platform.save_actor(
+        Actor(id='generator', name='生成身份', provider_id=provider.id)
+    )
+    return platform
+
+
+class GeneratorClient:
+    def __init__(self, bad_selection=False, bad_age=False):
+        self.bad_selection = bad_selection
+        self.bad_age = bad_age
+        self.contexts = []
+        self.concept_calls = 0
+
+    async def generate(self, provider, system, context, output_type):
+        self.contexts.append(deepcopy(context))
+        if output_type is CharacterConcept:
+            self.concept_calls += 1
+            reductions = {name: 0 for name in make_character().attributes}
+            if self.bad_age and self.concept_calls == 1:
+                reductions['STR'] = 5
+            value = CharacterConcept(
+                name='古董商',
+                age=30,
+                sex='女',
+                residence='上海',
+                birthplace='苏州',
+                occupation='古董商',
+                age_reductions=reductions,
+                background=make_character().background,
+            )
+        else:
+            selected = make_character().allocations['selected_skills']
+            if self.bad_selection:
+                selected = selected[:-1]
+            value = CharacterAllocation(
+                selected_skills=selected,
+                occupational={
+                    name: 20
+                    for name in make_character().allocations['selected_skills']
+                },
+                interests={
+                    '侦查': 20,
+                    '聆听': 20,
+                    '潜行': 20,
+                    '图书馆使用': 20,
+                },
+            )
+        return SimpleNamespace(value=value, usage=10)
+
+
+async def test_zero_age_deductions_and_arithmetic_errors_are_repaired(
+    tmp_path,
+    monkeypatch,
+):
+    client = GeneratorClient()
+    platform = generation_platform(tmp_path, client)
+    monkeypatch.setattr(
+        'aitrpg.application.characters.generate_attributes',
+        lambda: (make_character().attributes, []),
+    )
+    character = await platform.characters.generate('generator', '古董商概念')
+    assert client.concept_calls == 1
+    assert character.age == 30
+    assert character.occupation == '古董商'
+    assert character.skills['信用评级'] == 30
+    assert sum(character.allocations['occupational'].values()) == (
+        character.attributes['EDU'] * 4
+    )
+    assert sum(character.allocations['interests'].values()) == 120
+    assert character.skills['侦查'] == 55
+    assert character.allocations['allocation_adjustments']
+
+
+async def test_concept_repair_receives_error_and_reuses_raw_attributes(
+    tmp_path,
+    monkeypatch,
+):
+    client = GeneratorClient(bad_age=True)
+    platform = generation_platform(tmp_path, client)
+    raw_calls = []
+
+    def raw_attributes():
+        raw_calls.append('draw')
+        return make_character().attributes, []
+
+    monkeypatch.setattr(
+        'aitrpg.application.characters.generate_attributes', raw_attributes
+    )
+    result = await platform.characters.generate('generator', '古董商概念')
+    assert client.concept_calls == 2
+    assert '扣点总量' in client.contexts[1]['previous_error']
+    assert client.contexts[1]['previous_concept']['age_reductions']['STR'] == 5
+    assert raw_calls == ['draw']
+    assert result.attributes['STR'] == 60
+
+
+async def test_failed_generation_reuses_draft_on_new_service_retry(
+    tmp_path,
+    monkeypatch,
+):
+    client = GeneratorClient(bad_selection=True)
+    platform = generation_platform(tmp_path, client)
+    raw_calls = []
+    age_calls = []
+    original_age = characters_module.apply_age
+
+    def raw_attributes():
+        raw_calls.append('draw')
+        return make_character().attributes, []
+
+    def tracked_age(*args, **kwargs):
+        age_calls.append('age')
+        return original_age(*args, **kwargs)
+
+    monkeypatch.setattr(
+        'aitrpg.application.characters.generate_attributes', raw_attributes
+    )
+    monkeypatch.setattr('aitrpg.application.characters.apply_age', tracked_age)
+    with pytest.raises(ValueError, match='连续三次'):
+        await platform.characters.generate('generator', '同一失败概念')
+    diagnostics = next(
+        context['budget_diagnostics']
+        for context in client.contexts
+        if 'budget_diagnostics' in context
+    )
+    assert diagnostics['occupational_used'] == 160
+    assert diagnostics['interest_used'] == 80
+    assert diagnostics['interest_remaining'] == 40
+    attempt = platform.store.list('character_attempt')[0]
+    draft = platform.store.get('creation_draft', attempt['draft_id'])
+    client.bad_selection = False
+    restored = Platform(Settings(data_dir=tmp_path / 'generation'), client)
+    result = await restored.characters.generate('generator', '同一失败概念')
+    assert raw_calls == ['draw']
+    assert age_calls == ['age']
+    assert client.concept_calls == 1
+    assert result.attributes == draft['attributes']
+    assert result.luck == draft['luck']
+    assert [roll.id for roll in result.creation_rolls] == [
+        roll['id'] for roll in draft['creation_rolls']
+    ]
+
+
+def test_clone_keeps_growth_without_modifying_locked_original(tmp_path):
+    platform = Platform(Settings(data_dir=tmp_path / 'cloning'))
+    platform.save_actor(Actor(id='actor', name='模型', connection='mcp'))
+    original = make_character()
+    original.skills['侦查'] = 91
+    original.current_hp = 4
+    original.experiences = ['完成了上一模组']
+    original.locked_game_id = 'active-game'
+    platform.store.put(
+        'character', original.id, original.model_dump(mode='json')
+    )
+    copied = platform.characters.clone(original.id, '另一个世界的调查员')
+    assert copied.id != original.id
+    assert copied.locked_game_id is None
+    assert copied.current_hp == 4
+    assert copied.skills['侦查'] == 91
+    assert copied.experiences == ['完成了上一模组']
+    assert platform.characters.get(original.id).locked_game_id == 'active-game'
