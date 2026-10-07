@@ -517,3 +517,144 @@ async def test_checkpoint_resumes_second_attack_without_replaying_first_hit():
         resumed, restored_game, restored_cards, attack, restored_work
     )
     assert len(restored_work['events']) == events_before
+
+
+@pytest.mark.parametrize('effect_name', ['stun', '眩晕'])
+async def test_taser_damage_and_conditional_effect_use_real_server_dice(
+    effect_name,
+):
+    investigator = card()
+    investigator.damage_bonus = '1D4'
+    investigator.weapons = [
+        {
+            'name': '接触电击器',
+            'damage': f'1D3+{effect_name}',
+        }
+    ]
+    cards = {investigator.id: investigator}
+    game = game_for(cards)
+    service = GameService(values=[0, 4, 0, 9, 2, 4])
+    working = work()
+    await start(service, game, cards, working, npcs=[npc(dex=20)])
+    await apply_game_command(
+        service,
+        game,
+        cards,
+        RuleCommand(
+            kind='combat_attack',
+            reason='主持裁定接触电击采用卡上斗殴技能，适用性等待反馈',
+            parameters={
+                'target_id': 'cultist',
+                'weapon_index': 0,
+                'skill': '格斗：斗殴',
+                'mode': 'melee',
+            },
+        ),
+        working,
+    )
+    target = next(e for e in game.combat['order'] if e['id'] == 'cultist')
+    assert target['hp'] == 18
+    assert 'stunned' not in target['conditions']
+    effect = next(
+        e['data']['details']
+        for e in working['events']
+        if e['kind'] == 'ruling'
+        and e['data'].get('command') == 'weapon_effect'
+    )
+    assert effect['duration_rounds_if_applied'] == 4
+    assert effect['status'] == 'pending_keeper_ruling'
+    assert investigator.weapons[0]['damage'] == f'1D3+{effect_name}'
+
+
+async def test_unrecognised_weapon_text_is_rejected_before_attack_roll():
+    investigator = card()
+    investigator.weapons = [
+        {
+            'name': '自定义装置',
+            'skill': '格斗：斗殴',
+            'damage': '1D3+修仙',
+        }
+    ]
+    cards = {investigator.id: investigator}
+    game = game_for(cards)
+    service = GameService()
+    working = work()
+    await start(service, game, cards, working, npcs=[npc(dex=20)])
+    with pytest.raises(ValueError):
+        await apply_game_command(
+            service,
+            game,
+            cards,
+            RuleCommand(
+                kind='combat_attack',
+                reason='尝试使用含未知文字的伤害骰式',
+                parameters={'target_id': 'cultist', 'weapon_index': 0},
+            ),
+            working,
+        )
+    assert working['has_rolls'] is False
+    assert combat_turn(game)['id'] == investigator.id
+
+
+async def test_defender_can_use_legacy_knife_with_official_brawl_skill():
+    investigator = card()
+    investigator.weapons = [{'name': '格斗刀', 'damage': '1D4+2'}]
+    cards = {investigator.id: investigator}
+    game = game_for(cards)
+    service = GameService(values=[0, 4, 0, 2, 2])
+    service.response = PlayerResponse(
+        defense='fight_back', defense_weapon_index=0
+    )
+    working = work()
+    await start(service, game, cards, working)
+    await apply_game_command(
+        service,
+        game,
+        cards,
+        RuleCommand(
+            kind='combat_attack',
+            reason='NPC攻击，调查员自行选择格斗刀还击',
+            parameters={'target_id': investigator.id},
+        ),
+        working,
+    )
+    target = next(e for e in game.combat['order'] if e['id'] == 'cultist')
+    assert target['hp'] == 16
+    assert cards[investigator.id].current_hp == 12
+    assert service.reactions[0]['actor_id'] == investigator.actor_id
+
+
+async def test_player_fights_back_with_chosen_legacy_contact_taser():
+    investigator = card()
+    investigator.damage_bonus = '1D4'
+    investigator.weapons = [
+        {
+            'name': '电击器',
+            'damage': '1D3+眩晕',
+            'notes': '非致命、需接触',
+        }
+    ]
+    cards = {investigator.id: investigator}
+    game = game_for(cards)
+    service = GameService(values=[0, 4, 0, 2, 2, 4])
+    service.response = PlayerResponse(
+        defense='fight_back', defense_weapon_index=0
+    )
+    working = work()
+    await start(service, game, cards, working)
+    await apply_game_command(
+        service,
+        game,
+        cards,
+        RuleCommand(
+            kind='combat_attack',
+            reason='NPC攻击，角色独立选择电击器还击',
+            parameters={'target_id': investigator.id},
+        ),
+        working,
+    )
+    target = next(e for e in game.combat['order'] if e['id'] == 'cultist')
+    assert target['hp'] == 18
+    assert cards[investigator.id].current_hp == 12
+    assert service.reactions[0]['actor_id'] == investigator.actor_id
+    assert investigator.weapons[0].get('skill') is None

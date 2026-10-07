@@ -240,6 +240,8 @@ class Invitation(Entity):
         'keeper_opening',
         'keeper_resolution',
         'keeper_feedback',
+        'keeper_control',
+        'keeper_repair',
         'reaction',
     ]
     scene_id: str
@@ -260,6 +262,19 @@ class PlayerResponse(Model):
     is_pass: bool = False
     defense: Literal['dodge', 'fight_back', 'cover'] | None = None
     defense_weapon_index: int | None = Field(default=None, ge=0)
+
+
+class KeeperControl(Model):
+    clock_status: Literal[
+        'unchanged', 'supported', 'estimated', 'needs_review'
+    ]
+    scene_status: Literal['unchanged', 'supported', 'needs_review']
+    target_day: int | None = Field(default=None, ge=0)
+    target_hour: float | None = Field(default=None, ge=0, lt=24)
+    scene_id: str = ''
+    clock_quote: str = ''
+    scene_quote: str = ''
+    reason: str = ''
 
 
 class CheckRequest(Model):
@@ -285,6 +300,16 @@ class RuleCommand(Model):
     is_private: bool = False
 
 
+class RulingRepair(Model):
+    commands: list[RuleCommand] = Field(default_factory=list)
+    checks: list[CheckRequest] = Field(default_factory=list)
+    narration: str = Field(min_length=1)
+    reason: str = Field(min_length=1, max_length=2000)
+    private_messages: dict[str, str] = Field(default_factory=dict)
+    improvisation: str = ''
+    flags: dict[str, Any] = Field(default_factory=dict)
+
+
 class KeeperResponse(Model):
     narration: str = Field(default='', max_length=12000)
     invite_actor_ids: list[str] = Field(default_factory=list)
@@ -296,6 +321,7 @@ class KeeperResponse(Model):
     reveal_clue_ids: list[str] = Field(default_factory=list)
     reveal_asset_ids: list[str] = Field(default_factory=list)
     recipient_actor_ids: list[str] = Field(default_factory=list)
+    private_messages: dict[str, str] = Field(default_factory=dict)
     flags: dict[str, Any] = Field(default_factory=dict)
     advance_days: int = Field(default=0, ge=0, le=365)
     advance_hours: float = Field(default=0, ge=0, le=8760)

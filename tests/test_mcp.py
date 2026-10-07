@@ -369,6 +369,126 @@ async def test_reference_agent_reports_invalid_token_without_retrying(table):
         )
 
 
+async def test_keeper_control_invitation_and_agent_keep_host_scope(table):
+    control = {
+        'clock_status': 'supported',
+        'scene_status': 'unchanged',
+        'target_day': 1,
+        'target_hour': 6,
+        'clock_quote': '第二天六点，调查员登上船。',
+        'reason': '已发生的出发时间',
+    }
+
+    def prepare_invitation():
+        item = Invitation(
+            game_id=table.game.id,
+            actor_id=table.actors[0].id,
+            revision=table.game.revision,
+            purpose='keeper_control',
+            scene_id='hall',
+            expires_at=utc_now() + timedelta(seconds=120),
+            context={'narration': control['clock_quote']},
+        )
+        table.platform.store.put(
+            'invitation', item.id, item.model_dump(mode='json')
+        )
+        return item
+
+    item = prepare_invitation()
+    async with Client(table.endpoint) as client:
+        waiting = await call(
+            client, 'wait_for_invitation', table.tokens[1], wait_seconds=0
+        )
+        assert waiting['invitation'] is None
+        assert table.platform.store.get('invitation', item.id)['status'] == (
+            'pending'
+        )
+        stolen = await client.call_tool(
+            'submit_response',
+            {
+                'token': table.tokens[1],
+                'invitation_id': item.id,
+                'submission_id': 'stolen-control',
+                'response': control,
+            },
+        )
+        assert stolen.is_error
+        claimed = await call(
+            client, 'wait_for_invitation', table.tokens[0], wait_seconds=0
+        )
+        assert claimed['id'] == item.id
+        wrong_response = await client.call_tool(
+            'submit_response',
+            {
+                'token': table.tokens[0],
+                'invitation_id': item.id,
+                'submission_id': 'broad-response',
+                'response': {'narration': '新增了不应存在的剧情'},
+            },
+        )
+        assert wrong_response.is_error
+        accepted = await call(
+            client,
+            'submit_response',
+            table.tokens[0],
+            invitation_id=item.id,
+            submission_id='valid-control',
+            response=control,
+        )
+        assert accepted['accepted']
+
+    next_item = prepare_invitation()
+    provider = Provider(
+        name='外部主持模型', base_url='http://localhost/unused'
+    )
+    used_providers = []
+
+    class ControlGenerator:
+        async def generate(self, selected, system, context, output_type):
+            used_providers.append(selected.id)
+            return Generation(
+                value=output_type.model_validate(control), usage=10
+            )
+
+    class EndAfterControlClient:
+        def __init__(self, endpoint):
+            self.client = Client(endpoint)
+
+        async def __aenter__(self):
+            await self.client.__aenter__()
+            return self
+
+        async def __aexit__(self, *args):
+            return await self.client.__aexit__(*args)
+
+        async def call_tool(self, name, arguments, **kwargs):
+            result = await self.client.call_tool(name, arguments, **kwargs)
+            if name == 'submit_response' and not result.is_error:
+                game = table.platform.get_game(table.game.id)
+                game.status = 'ended'
+                table.platform.store.put(
+                    'game', game.id, game.model_dump(mode='json')
+                )
+            return result
+
+    result = await asyncio.wait_for(
+        run_agent(
+            table.endpoint,
+            table.tokens[0],
+            provider,
+            provider_client=ControlGenerator(),
+            client_factory=EndAfterControlClient,
+        ),
+        10,
+    )
+    assert result['status'] == 'ended'
+    assert used_providers == [provider.id]
+    submitted = table.platform.store.get('invitation', next_item.id)
+    assert submitted['status'] == 'submitted'
+    assert submitted['response']['target_day'] == 1
+    assert submitted['response']['target_hour'] == 6
+
+
 async def test_bootstrap_cards_do_not_grant_game_or_foreign_actor_access(
     table,
 ):

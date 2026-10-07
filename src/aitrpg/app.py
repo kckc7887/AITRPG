@@ -30,5 +30,6 @@ def create_app(settings: Settings | None = None, is_ui: bool = True):
             storage_secret=storage['secret'],
             title='AITRPG',
             language='zh-CN',
+            reconnect_timeout=30,
         )
     return app

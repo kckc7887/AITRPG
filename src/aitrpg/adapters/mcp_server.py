@@ -12,6 +12,7 @@ from mcp.types import ToolAnnotations
 from pydantic import Field
 
 from aitrpg.domain.models import Character
+from aitrpg.domain.models import KeeperControl
 from aitrpg.domain.models import KeeperResponse
 from aitrpg.domain.models import PlayerResponse
 from aitrpg.domain.models import utc_now
@@ -260,11 +261,21 @@ class AgentGateway:
                 arguments['token'], arguments.get('wait_seconds', 20)
             )
             if result.get('id'):
-                response_type = (
-                    KeeperResponse
-                    if result['purpose'].startswith('keeper_')
-                    else PlayerResponse
-                )
+                if result['purpose'] == 'keeper_control':
+                    response_type = KeeperControl
+                elif result['purpose'] == 'keeper_repair':
+                    from aitrpg.application.ruling_repair import (
+                        scoped_repair_type,
+                    )
+
+                    response_type = scoped_repair_type(
+                        result['context'].get('allowed_attacker_id'),
+                        result['context'].get('is_attack_allowed', True),
+                    )
+                elif result['purpose'].startswith('keeper_'):
+                    response_type = KeeperResponse
+                else:
+                    response_type = PlayerResponse
                 result['response_schema'] = response_type.model_json_schema()
             return result
         if name == 'get_my_state':

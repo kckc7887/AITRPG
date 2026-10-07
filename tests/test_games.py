@@ -1,11 +1,15 @@
 import asyncio
 import inspect
 import json
+import os
 import shutil
+import subprocess
+import sys
 from copy import deepcopy
 
 import pytest
 
+from aitrpg.adapters.process import is_process_alive
 from aitrpg.adapters.providers import Generation
 from aitrpg.adapters.storage import ConflictError
 from aitrpg.application.platform import Platform
@@ -17,8 +21,11 @@ from aitrpg.domain.models import KeeperResponse
 from aitrpg.domain.models import PlayerResponse
 from aitrpg.domain.models import Provider
 from aitrpg.domain.models import RuleCommand
+from aitrpg.domain.models import Scenario
 from aitrpg.domain.models import ScenarioAsset
+from aitrpg.domain.models import ScenarioContent
 from aitrpg.domain.models import ScenarioRole
+from aitrpg.domain.models import ScenarioScene
 from aitrpg.domain.models import SourceBlock
 from aitrpg.domain.rules import apply_command
 from aitrpg.domain.rules import skill_check
@@ -40,6 +47,8 @@ class ScriptedClient:
         value = self.handler(call)
         if inspect.isawaitable(value):
             value = await value
+        if type(value) is not output_type and hasattr(value, 'model_dump'):
+            value = value.model_dump(mode='json')
         return Generation(
             value=output_type.model_validate(value), usage=self.usage
         )
@@ -55,7 +64,13 @@ class ScriptedClient:
         return KeeperResponse(narration='现场保持安静')
 
 
-def setup_platform(tmp_path, client=None, grouped=True, secret_scenario=False):
+def setup_platform(
+    tmp_path,
+    client=None,
+    grouped=True,
+    secret_scenario=False,
+    scenario_transform=None,
+):
     platform = Platform(
         Settings(data_dir=tmp_path / 'platform'), client or ScriptedClient()
     )
@@ -110,6 +125,8 @@ def setup_platform(tmp_path, client=None, grouped=True, secret_scenario=False):
                 item.source_ids = ['source-keeper']
         scenario = platform.scenarios.save(scenario)
         scenario = platform.scenarios.approve(scenario.id)
+    if scenario_transform:
+        scenario = scenario_transform(platform, scenario)
     for actor_id in ('keeper', 'player-0', 'player-1', 'player-2'):
         provider = platform.save_provider(
             Provider(
@@ -473,7 +490,8 @@ def test_group_role_source_and_private_image_remain_isolated(tmp_path):
     viewer = platform.games.view(game.id, 'player-1')
     text = json.dumps(viewer, ensure_ascii=False)
     assert 'PRIVATE_ROLE_1' in text
-    assert 'PUBLIC_SCENE_B' in text
+    assert 'PUBLIC_SCENE_B' not in text
+    assert viewer['game']['scene_id'] == 'control'
     for secret in (
         'PRIVATE_ROLE_0',
         'PRIVATE_ROLE_2',
@@ -1115,3 +1133,636 @@ def test_medicine_checks_high_skill_healer_and_changes_only_patient(tmp_path):
     assert details['healer_id'] == doctor.id
     assert patient.current_hp == 6
     assert doctor.current_hp == 12
+
+
+@pytest.mark.parametrize('same_top_level', [False, True])
+async def test_time_command_normalisation_and_cached_resume_apply_once(
+    tmp_path,
+    monkeypatch,
+    same_top_level,
+):
+    def handler(call):
+        if call['task'] == 'keeper_resolution':
+            return KeeperResponse(
+                narration='过去半小时',
+                advance_hours=0.5 if same_top_level else 0,
+                commands=[
+                    RuleCommand(
+                        kind='advance_hours',
+                        reason='现场等待半小时',
+                        parameters={'hours': 0.5},
+                    )
+                ],
+            )
+        return ScriptedClient.default(call)
+
+    client = ScriptedClient(handler)
+    platform, game, _, _ = setup_platform(tmp_path, client)
+    original_put = platform.store.put
+    interrupted = []
+
+    def fail_before_preparation(kind, identity, data):
+        if kind == 'resolution_work' and not interrupted:
+            interrupted.append(True)
+            raise RuntimeError('模拟保存工作帧前退出')
+        return original_put(kind, identity, data)
+
+    monkeypatch.setattr(platform.store, 'put', fail_before_preparation)
+    paused = await platform.step_game(game.id)
+    assert '工作帧' in paused.last_error
+    assert paused.hour == 8
+    previous_calls = len(client.calls)
+    restored = Platform(Settings(data_dir=tmp_path / 'platform'), client)
+    result = await restored.step_game(game.id)
+    assert not result.last_error
+    assert result.node_count == 1
+    assert result.hour == 8.5
+    assert len(client.calls) == previous_calls
+
+
+@pytest.mark.parametrize('has_success', [False, True])
+async def test_empty_growth_request_needs_current_success_and_never_repeats_it(
+    tmp_path,
+    monkeypatch,
+    has_success,
+):
+    def handler(call):
+        if call['task'] == 'keeper_resolution':
+            if has_success:
+                return KeeperResponse(
+                    checks=[
+                        CheckRequest(
+                            character_id='card-0',
+                            skill='侦查',
+                        )
+                    ]
+                )
+            return KeeperResponse(
+                commands=[
+                    RuleCommand(
+                        kind='mark_skill',
+                        character_id='card-0',
+                        parameters={},
+                        reason='未提供成功依据',
+                    )
+                ]
+            )
+        if call['task'] == 'keeper_feedback':
+            return KeeperResponse(
+                narration='自动成功标记已记录',
+                commands=[
+                    RuleCommand(
+                        kind='mark_skill',
+                        character_id='card-0',
+                        parameters={},
+                        reason='回述自动记录的标记',
+                    ),
+                ],
+            )
+        return ScriptedClient.default(call)
+
+    platform, game, _, _ = setup_platform(tmp_path, ScriptedClient(handler))
+    rolls = install_fixed_check(monkeypatch)
+    if not has_success:
+        previous = platform.store.get('character', 'card-0')
+        previous['skill_marks'] = ['侦查']
+        platform.store.put('character', 'card-0', previous)
+    result = await platform.step_game(game.id)
+    if has_success:
+        assert not result.last_error
+        assert result.node_count == 1
+        assert len(rolls) == 1
+        assert platform.characters.get('card-0').skill_marks == ['侦查']
+    else:
+        assert '必须指定已成功' in result.last_error
+        assert result.node_count == 0
+        assert len(rolls) == 0
+
+
+async def test_partial_clue_note_is_private_and_does_not_reveal_full_clue(
+    tmp_path,
+):
+    def handler(call):
+        if call['task'] == 'keeper_resolution':
+            return KeeperResponse(
+                narration='公开只看见日志的一小段',
+                scene_id='control',
+                commands=[
+                    RuleCommand(
+                        kind='custom',
+                        reason='只读到了残缺内容',
+                        parameters={
+                            'note': 'KEEPER_PARTIAL_NOTE',
+                            'clue_partial': 'log',
+                        },
+                    ),
+                ],
+            )
+        return ScriptedClient.default(call)
+
+    platform, game, _, scenario = setup_platform(
+        tmp_path, ScriptedClient(handler)
+    )
+    before = [
+        (
+            card.current_hp,
+            card.current_mp,
+            card.current_san,
+            deepcopy(card.skills),
+            deepcopy(card.background),
+        )
+        for card in platform.characters.list()
+    ]
+    result = await platform.step_game(game.id)
+    assert not result.last_error
+    after = [
+        (
+            card.current_hp,
+            card.current_mp,
+            card.current_san,
+            card.skills,
+            card.background,
+        )
+        for card in platform.characters.list()
+    ]
+    assert after == before
+    player = json.dumps(
+        platform.games.view(game.id, 'player-0'), ensure_ascii=False
+    )
+    keeper = json.dumps(
+        platform.games.view(game.id, 'keeper'), ensure_ascii=False
+    )
+    assert '公开只看见日志的一小段' in player
+    assert 'KEEPER_PARTIAL_NOTE' not in player
+    assert scenario.clues[0].text not in player
+    assert 'KEEPER_PARTIAL_NOTE' in keeper
+    assert 'log' not in result.knowledge.get('player-0', [])
+
+
+async def test_global_custom_changes_without_character_are_rejected(tmp_path):
+    def handler(call):
+        if call['task'] == 'keeper_resolution':
+            return KeeperResponse(
+                commands=[
+                    RuleCommand(
+                        kind='custom',
+                        reason='无归属的状态修改',
+                        parameters={'changes': {'current_hp': 1}},
+                    )
+                ]
+            )
+        return ScriptedClient.default(call)
+
+    platform, game, _, _ = setup_platform(tmp_path, ScriptedClient(handler))
+    result = await platform.step_game(game.id)
+    assert '无角色' in result.last_error
+    assert result.node_count == 0
+    assert all(card.current_hp == 12 for card in platform.characters.list())
+
+
+async def test_bounded_context_selects_future_scene_without_player_leaks(
+    tmp_path,
+):
+    def richer_scenario(platform, scenario):
+        scenario.source_blocks.extend(
+            [
+                SourceBlock(
+                    id=f'noise-{index}',
+                    file=f'INDEX_NOISE_{index}.docx',
+                    locator=f'其他章第{index}段',
+                    text='另一个场景的无关资料',
+                )
+                for index in range(500)
+            ]
+        )
+        scenario.endings[0].text = 'PRIVATE_ENDING_PLAN：完整的终局条件与秘密'
+        saved = platform.scenarios.save(scenario)
+        return platform.scenarios.approve(saved.id)
+
+    def handler(call):
+        context = call['context']
+        if call['task'] == 'player':
+            return PlayerResponse(
+                speech=context['self_character_name'] + '决定继续调查',
+                intent='由' + context['self_actor_id'] + '观察设备',
+            )
+        if call['task'] == 'keeper_resolution':
+            target = next(
+                scene
+                for scene in context['scene_catalog']
+                if scene['title'] == '控制室'
+            )
+            ending = next(
+                ending
+                for ending in context['scenario']['endings']
+                if ending['id'] == 'safe'
+            )
+            return KeeperResponse(
+                narration='调查员走进控制室',
+                scene_id=target['id'],
+                improvisation=ending['text'],
+            )
+        return ScriptedClient.default(call)
+
+    client = ScriptedClient(handler)
+    platform, game, _, _ = setup_platform(
+        tmp_path,
+        client,
+        secret_scenario=True,
+        scenario_transform=richer_scenario,
+    )
+    card = platform.store.get('character', 'card-0')
+    card['allocations']['history'] = 'ALLOCATION_HISTORY_ONLY' + 'x' * 30000
+    card['creation_rolls'] = [
+        {
+            'expression': '1D100',
+            'total': 42,
+            'reason': 'RAW_CREATION_AUDIT_ONLY' + 'y' * 30000,
+        }
+    ]
+    platform.store.put('character', 'card-0', card)
+    result = await platform.step_game(game.id)
+    assert not result.last_error
+    assert result.scene_id == 'control'
+    player_calls = [call for call in client.calls if call['task'] == 'player']
+    assert player_calls[0]['actor'] == 'player-0'
+    events = platform.store.events(game.id)
+    assert any(
+        event['kind'] == 'player'
+        and event['data']['speech'] == '调查员0决定继续调查'
+        for event in events
+    )
+    resolution = next(
+        call['context']
+        for call in client.calls
+        if call['task'] == 'keeper_resolution'
+    )
+    prompt = json.dumps(resolution, ensure_ascii=False)
+    assert len(prompt) < 20000
+    assert 'KEEPER_SOURCE_SECRET' in prompt
+    for call in client.calls:
+        if call['task'] == 'player':
+            assert 'KEEPER_SOURCE_SECRET' not in json.dumps(call['context'])
+    player_context = json.dumps(
+        platform.games.context(result, 'player-0', 'player'),
+        ensure_ascii=False,
+    )
+    assert 'PRIVATE_ENDING_PLAN' not in player_context
+    assert 'ALLOCATION_HISTORY_ONLY' not in prompt
+    assert 'RAW_CREATION_AUDIT_ONLY' not in prompt
+    assert 'INDEX_NOISE_' not in prompt
+
+
+async def test_second_service_does_not_pause_live_process_game(tmp_path):
+    started = asyncio.Event()
+    release = asyncio.Event()
+
+    async def handler(call):
+        if call['task'] == 'keeper_opening':
+            started.set()
+            await release.wait()
+        return ScriptedClient.default(call)
+
+    client = ScriptedClient(handler)
+    first, game, _, _ = setup_platform(tmp_path, client)
+    pending = asyncio.create_task(first.step_game(game.id))
+    try:
+        await asyncio.wait_for(started.wait(), timeout=2)
+        second = Platform(Settings(data_dir=tmp_path / 'platform'), client)
+        observed = second.get_game(game.id)
+        assert observed.status == 'running'
+        assert first.get_game(game.id).status == 'running'
+        assert not observed.last_error
+        assert is_process_alive(os.getpid())
+    finally:
+        await first.pause_game(game.id)
+        with pytest.raises(asyncio.CancelledError):
+            await pending
+
+
+@pytest.mark.parametrize('exit_code', [0, 259])
+def test_dead_runner_process_restores_paused_without_losing_progress(
+    tmp_path,
+    exit_code,
+):
+    platform, game, _, _ = setup_platform(tmp_path)
+    flags = subprocess.CREATE_NO_WINDOW if os.name == 'nt' else 0
+    with subprocess.Popen(
+        [sys.executable, '-c', f'import sys; sys.exit({exit_code})'],
+        stdout=subprocess.DEVNULL,
+        stderr=subprocess.DEVNULL,
+        creationflags=flags,
+    ) as helper:
+        helper.wait(timeout=5)
+        game.status = 'waiting'
+        game.node_count = 7
+        game.day = 3
+        game.hour = 17.5
+        game.scheduler['runner_pid'] = helper.pid
+        platform.store.put('game', game.id, game.model_dump(mode='json'))
+        restored = Platform(Settings(data_dir=tmp_path / 'platform'))
+        recovered = restored.get_game(game.id)
+        assert recovered.status == 'paused'
+        assert recovered.node_count == 7
+        assert recovered.day == 3 and recovered.hour == 17.5
+        assert '重新启动' in recovered.last_error
+        assert restored.characters.get('card-0').locked_game_id == game.id
+
+
+async def test_next_module_keeps_injuries_growth_items_and_background(
+    tmp_path,
+):
+    def handler(call):
+        if call['task'] == 'keeper_resolution':
+            return KeeperResponse(
+                narration='本次调查结束',
+                is_finished=True,
+                ending='完成本次调查',
+            )
+        return ScriptedClient.default(call)
+
+    platform, game, cards, _ = setup_platform(
+        tmp_path, ScriptedClient(handler)
+    )
+    veteran = platform.characters.get('card-0')
+    veteran.current_hp = 7
+    veteran.current_mp = 3
+    veteran.current_san = 41
+    veteran.skills['侦查'] = 88
+    veteran.skill_marks = ['侦查']
+    veteran.conditions = ['major_wound', 'temporary_insanity']
+    veteran.allocations['runtime'] = {
+        'lifetime_day': 7,
+        'temporary_insanity_hours': 4,
+    }
+    veteran.inventory = [{'id': 'key', 'name': '铜钥匙'}]
+    veteran.weapons = [
+        {'name': '旧手枪', 'skill': '射击：手枪', 'damage': '1D10'}
+    ]
+    veteran.assets = {'cash': 25, 'armor': 1, 'details': '继承的旧宅'}
+    veteran.experiences = ['完成了前一个模组']
+    veteran.relationships = ['与医生成为了朋友']
+    veteran.background['significant_people'] = '失踪的姐姐'
+    platform.store.put(
+        'character', veteran.id, veteran.model_dump(mode='json')
+    )
+    game.scheduler['base_day'] = 7
+    platform.store.put('game', game.id, game.model_dump(mode='json'))
+    ended = await platform.step_game(game.id)
+    assert ended.status == 'ended'
+    next_scenario = platform.scenarios.save(
+        Scenario(
+            title='不同的后续模组',
+            source='builtin:test-next-module',
+            author='测试',
+            rights='原创测试内容',
+            scenes=[
+                ScenarioScene(
+                    id='start',
+                    title='新的入口',
+                    public_text='踏入新调查',
+                    keeper_text='新的真相',
+                )
+            ],
+            endings=[
+                ScenarioContent(id='done', title='后续结局', text='新的结束')
+            ],
+        )
+    )
+    next_scenario = platform.scenarios.approve(next_scenario.id)
+    next_game = platform.create_game(
+        '下一模组',
+        next_scenario.id,
+        'keeper',
+        [
+            {'actor_id': card.actor_id, 'character_id': card.id}
+            for card in cards
+        ],
+    )
+    continued = platform.characters.get(veteran.id)
+    assert continued.locked_game_id == next_game.id
+    assert (
+        continued.current_hp,
+        continued.current_mp,
+        continued.current_san,
+    ) == (
+        7,
+        3,
+        41,
+    )
+    assert continued.skills['侦查'] == 88
+    assert continued.skill_marks == ['侦查']
+    assert continued.conditions == ['major_wound', 'temporary_insanity']
+    assert continued.inventory[0]['name'] == '铜钥匙'
+    assert continued.weapons[0]['name'] == '旧手枪'
+    assert continued.assets['details'] == '继承的旧宅'
+    assert continued.relationships == ['与医生成为了朋友']
+    assert continued.background['significant_people'] == '失踪的姐姐'
+    assert continued.experiences == [
+        '完成了前一个模组',
+        '测试团：完成本次调查',
+    ]
+    assert continued.allocations['runtime']['temporary_insanity_hours'] == 4
+    assert next_game.scheduler['base_day'] == 7
+
+
+async def test_model_receives_authorised_map_without_storing_image_payload(
+    tmp_path,
+):
+    client = ScriptedClient()
+    platform, game, _, scenario = setup_platform(tmp_path, client)
+    for provider in platform.list_providers():
+        provider.is_vision = True
+        platform.save_provider(provider)
+    original = scenario.assets[0]
+    original.is_map = True
+    original.visibility = 'keeper'
+    scenario.assets = [original]
+    platform.store.put(
+        'scenario_version',
+        f'{scenario.id}@{scenario.version}',
+        scenario.model_dump(mode='json'),
+    )
+    result = await platform.step_game(game.id)
+    assert not result.last_error
+    opening = next(
+        call for call in client.calls if call['task'] == 'keeper_opening'
+    )
+    players = [call for call in client.calls if call['task'] == 'player']
+    assert opening['context']['_images'][0]['url'].startswith('data:image/')
+    assert all(not call['context'].get('_images') for call in players)
+    persisted = platform.store.list('invitation', game_id=game.id)
+    assert all(
+        not invitation['context'].get('_images') for invitation in persisted
+    )
+
+
+async def test_feedback_time_command_preserves_omitted_scene_and_days(
+    tmp_path, monkeypatch
+):
+    def handler(call):
+        if call['task'] == 'keeper_resolution':
+            return KeeperResponse(
+                narration='查明线索，次日进入控制室。',
+                scene_id='control',
+                advance_days=1,
+                reveal_clue_ids=[scenario.clues[0].id],
+                checks=[CheckRequest(character_id='card-0', skill='侦查')],
+            )
+        if call['task'] == 'keeper_feedback':
+            return KeeperResponse(
+                narration='线索已确认，进入控制室后又调查一小时。',
+                commands=[
+                    RuleCommand(
+                        kind='advance_hours',
+                        parameters={'hours': 1},
+                        reason='实际调查耗时',
+                    )
+                ],
+            )
+        return ScriptedClient.default(call)
+
+    client = ScriptedClient(handler)
+    platform, game, _, scenario = setup_platform(tmp_path, client)
+    rolls = install_fixed_check(monkeypatch)
+    result = await platform.step_game(game.id)
+    assert not result.last_error
+    assert (result.day, result.hour, result.scene_id) == (1, 9, 'control')
+    assert scenario.clues[0].id in result.knowledge['player-0']
+    assert len(rolls) == 1
+
+
+async def test_failed_model_responses_count_tokens_and_keep_safe_diagnostics(
+    tmp_path, monkeypatch
+):
+    import httpx
+
+    from aitrpg.adapters.providers import ProviderClient
+
+    monkeypatch.setenv('DEEPSEEK_API_KEY', 'never-log-this-test-key')
+    calls = []
+
+    def respond(request):
+        calls.append(request)
+        return httpx.Response(
+            200,
+            json={
+                'choices': [{'message': {'content': 'invalid-json'}}],
+                'usage': {'total_tokens': 123},
+            },
+        )
+
+    platform, game, _, _ = setup_platform(tmp_path)
+    platform.provider_client = ProviderClient(httpx.MockTransport(respond))
+    result = await platform.step_game(game.id)
+    failures = platform.store.list('provider_failure', game_id=game.id)
+    assert result.status == 'paused'
+    assert result.node_count == 0
+    assert result.token_usage == 246
+    assert len(calls) == 2
+    assert len(failures) == 1
+    assert failures[0]['purpose'] == 'keeper_opening'
+    assert 'never-log-this-test-key' not in str(failures)
+    assert 'invalid-json' not in str(failures)
+
+
+async def test_dependent_sanity_checks_reuse_existing_percentiles(
+    tmp_path, monkeypatch
+):
+    feedback_count = 0
+
+    def sanity_id(call, card_id):
+        return next(
+            event['data']['id']
+            for event in call['context']['actual_rule_results']
+            if event['kind'] == 'check'
+            and event['data'].get('character_id') == card_id
+            and event['data'].get('details', {}).get('skill') == 'SAN'
+        )
+
+    def handler(call):
+        nonlocal feedback_count
+        if call['task'] == 'keeper_resolution':
+            return KeeperResponse(
+                narration='第二名调查员已看见；第一名尚须仔细观察。',
+                checks=[
+                    CheckRequest(character_id='card-0', skill='侦查'),
+                    CheckRequest(character_id='card-1', skill='SAN'),
+                ],
+            )
+        if call['task'] == 'keeper_feedback':
+            feedback_count += 1
+            if feedback_count == 1:
+                return KeeperResponse(
+                    narration='第一名已看清，进行必要理智检定。',
+                    checks=[CheckRequest(character_id='card-0', skill='SAN')],
+                    commands=[
+                        RuleCommand(
+                            kind='sanity',
+                            character_id='card-1',
+                            parameters={
+                                'success_loss': '1',
+                                'failure_loss': '1D4',
+                                'sanity_check_id': sanity_id(call, 'card-1'),
+                            },
+                            reason='复用第二名已投理智',
+                        )
+                    ],
+                )
+            if feedback_count == 2:
+                return KeeperResponse(
+                    narration='第一名检定已完成，结算损失。',
+                    commands=[
+                        RuleCommand(
+                            kind='sanity',
+                            character_id='card-0',
+                            parameters={
+                                'success_loss': '1',
+                                'failure_loss': '1D4',
+                                'sanity_check_id': sanity_id(call, 'card-0'),
+                            },
+                            reason='结算第一名已投理智',
+                        )
+                    ],
+                )
+            return KeeperResponse(
+                narration='两人均成功稳住精神，各损失1点理智。'
+            )
+        return ScriptedClient.default(call)
+
+    platform, game, _, _ = setup_platform(tmp_path, ScriptedClient(handler))
+    rolls = install_fixed_check(monkeypatch)
+    result = await platform.step_game(game.id)
+    assert not result.last_error
+    assert result.node_count == 1
+    assert len(rolls) == 3
+    assert platform.characters.get('card-0').current_san == 59
+    assert platform.characters.get('card-1').current_san == 59
+    checks = [
+        event
+        for event in platform.store.events(game.id)
+        if event['kind'] == 'check' and event['data']['expression'] == '1D100'
+    ]
+    assert len(checks) == 3
+    assert feedback_count == 3
+
+
+async def test_internal_api_reply_outlives_mcp_deadline(tmp_path, monkeypatch):
+    from datetime import timedelta
+
+    from aitrpg.domain.models import utc_now
+
+    clock = utc_now()
+    monkeypatch.setattr('aitrpg.application.games.utc_now', lambda: clock)
+
+    class SlowClient(ScriptedClient):
+        async def generate(self, *args, **kwargs):
+            nonlocal clock
+            clock += timedelta(seconds=130)
+            return await super().generate(*args, **kwargs)
+
+    platform, game, _, _ = setup_platform(tmp_path, SlowClient())
+    result = await platform.step_game(game.id)
+    assert not result.last_error
+    assert result.node_count == 1
+    assert platform.store.events(game.id)[-1]['kind'] == 'narration'

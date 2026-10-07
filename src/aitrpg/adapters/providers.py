@@ -58,6 +58,8 @@ class ProviderClient:
             + '\nJSON Schema:\n'
             + json.dumps(schema, ensure_ascii=False)
         )
+        if provider.is_tool_mode:
+            instruction += '\n通过submit_result工具提交本次结果。'
         images = context.get('_images', [])
         if images and not provider.is_vision:
             raise ProviderError('当前配置未启用视觉能力')
@@ -84,6 +86,7 @@ class ProviderClient:
                     diagnostics = {
                         'finish_reason': data.get('stop_reason'),
                         'usage': data.get('usage'),
+                        'total_usage': total_usage,
                         'error_type': type(error).__name__,
                     }
                     if provider.protocol == 'openai':
@@ -100,8 +103,16 @@ class ProviderClient:
                         )
                     if isinstance(error, ValidationError):
                         diagnostics['validation'] = error.errors(
-                            include_input=False
+                            include_input=False, include_context=False
                         )
+                    cause = error.__cause__
+                    if isinstance(cause, json.JSONDecodeError):
+                        diagnostics['json_error'] = {
+                            'message': cause.msg,
+                            'line': cause.lineno,
+                            'column': cause.colno,
+                            'position': cause.pos,
+                        }
                     raise ProviderError(
                         '模型两次返回不合格的结构化结果', diagnostics
                     ) from error
@@ -110,11 +121,24 @@ class ProviderClient:
                     '\n上次输出不符合模式，请修正：'
                     + details
                     + '\n上次结果：'
-                    + json.dumps(data, ensure_ascii=False)[:12000].replace(
+                    + self._repair_content(provider, data).replace(
                         secret, '[隐藏]'
                     )
                 )
         raise ProviderError('模型未返回结果')
+
+    @staticmethod
+    def _repair_content(provider, data):
+        if provider.protocol == 'openai':
+            message = (data.get('choices') or [{}])[0].get('message', {})
+            value = message.get('tool_calls') or message.get('content') or ''
+        else:
+            value = [
+                block
+                for block in data.get('content', [])
+                if block.get('type') in {'text', 'tool_use'}
+            ]
+        return json.dumps(value, ensure_ascii=False)[:12000]
 
     async def _request(
         self, provider, secret, system, content, images, schema
@@ -190,7 +214,40 @@ class ProviderClient:
                     'name': 'submit_result',
                 }
         if provider.thinking_mode != 'default':
-            payload['thinking'] = {'type': provider.thinking_mode}
+            if provider.protocol == 'anthropic' and provider.model.startswith(
+                'deepseek'
+            ):
+                payload['reasoning'] = {
+                    'effort': (
+                        'none'
+                        if provider.thinking_mode == 'disabled'
+                        else 'high'
+                    )
+                }
+            else:
+                payload['thinking'] = {'type': provider.thinking_mode}
+                if (
+                    provider.protocol == 'anthropic'
+                    and provider.thinking_mode == 'enabled'
+                ):
+                    if provider.max_output_tokens <= 1024:
+                        raise ProviderError('启用思考需要输出上限大于1024')
+                    payload['thinking']['budget_tokens'] = max(
+                        1024, min(8192, provider.max_output_tokens // 2)
+                    )
+                    payload.pop('temperature', None)
+        if provider.is_tool_mode and provider.thinking_mode != 'disabled':
+            if provider.model.startswith('deepseek'):
+                payload['tool_choice'] = (
+                    'auto'
+                    if provider.protocol == 'openai'
+                    else {'type': 'auto'}
+                )
+            elif (
+                provider.protocol == 'anthropic'
+                and provider.thinking_mode == 'enabled'
+            ):
+                payload['tool_choice'] = {'type': 'auto'}
         async with httpx.AsyncClient(
             transport=self.transport, timeout=provider.timeout_seconds
         ) as client:

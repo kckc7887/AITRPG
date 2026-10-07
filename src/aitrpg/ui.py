@@ -60,6 +60,16 @@ CHECK_LABELS = {
     'failure': '失败',
     'fumble': '大失败',
 }
+CONDITION_LABELS = {
+    'dead': '死亡',
+    'unconscious': '昏迷',
+    'dying': '濒死',
+    'major_wound': '重伤',
+    'stabilized': '伤势已稳定',
+    'temporary_insanity': '临时疯狂',
+    'indefinite_insanity': '不定性疯狂',
+    'permanent_insanity': '永久疯狂',
+}
 
 
 def _data(value: Any) -> dict:
@@ -126,8 +136,8 @@ def _shell(title: str, path: str) -> None:
                 on_click=lambda destination=href: ui.navigate.to(destination),
             ).props('flat align=left').classes('w-full')
     with ui.header().classes('h-[68px] items-center px-5 gap-5'):
-        ui.button(icon='menu', on_click=drawer.toggle).props(
-            'flat round aria-label="打开导航"'
+        ui.button(icon='menu', on_click=drawer.toggle, color=None).props(
+            'flat round text-color=white aria-label="打开导航"'
         )
         ui.link('AITRPG', '/').classes('brand text-lg no-underline text-white')
         with ui.row().classes('desktop-navigation items-center gap-1'):
@@ -135,12 +145,13 @@ def _shell(title: str, path: str) -> None:
                 button = ui.button(
                     label,
                     icon=icon,
+                    color=None,
                     on_click=lambda destination=href: ui.navigate.to(
                         destination
                     ),
-                ).props('flat')
+                ).props('flat text-color=white')
                 if href == path:
-                    button.classes('bg-white/10')
+                    button.classes('nav-selected')
         ui.space()
         ui.label(title).classes('text-sm opacity-70')
 
@@ -663,7 +674,10 @@ def _character_detail(character: Any) -> None:
     if character.conditions:
         with ui.row().classes('gap-1'):
             for condition in character.conditions:
-                ui.badge(condition, color='secondary')
+                ui.badge(
+                    CONDITION_LABELS.get(condition, condition),
+                    color='secondary',
+                )
 
 
 def _character_generate_dialog(platform: Any, refresh: Callable) -> None:
@@ -1271,6 +1285,8 @@ def _event_content(event: dict, names: dict) -> tuple[str, str, str]:
             str(data.get('reason', '')),
             _json(data.get('details') or {}),
         )
+    if kind == 'control_projection':
+        return '叙事时空核对', str(data.get('reason', '')), _json(data)
     if kind == 'intervention':
         return '人工介入', str(data.get('text', data.get('reason', ''))), ''
     if kind == 'status':
@@ -1392,6 +1408,12 @@ class GameReader:
             ui.button(
                 '介入游戏', icon='edit_note', on_click=self.intervention
             ).props('flat')
+            self.sync_button = ui.button(
+                '核对叙事时空',
+                icon='update',
+                on_click=self.synchronise_controls,
+            ).props('flat')
+            self.sync_button.tooltip('暂停并核对已完成叙事的日期、时间和场景')
             ui.button(
                 '角色与地图', icon='map', on_click=self.sidebar_dialog
             ).props('flat').classes('mobile-sidebar-button')
@@ -1455,6 +1477,7 @@ class GameReader:
             self.step_button.set_enabled(
                 not is_ended and game.status != 'running' and not self.is_busy
             )
+            self.sync_button.set_enabled(not is_ended and not self.is_busy)
             characters = [
                 _data(item) for item in self.view.get('characters', [])
             ]
@@ -1818,14 +1841,15 @@ class GameReader:
         self.side_signature = ''
         self.refresh()
 
-    async def _operate(self, action: Callable) -> None:
+    async def _operate(self, action: Callable, success: str = '') -> None:
         if self.is_busy:
             return
         self.is_busy = True
         self.auto_button.disable()
         self.step_button.disable()
+        self.sync_button.disable()
         try:
-            await _perform(action)
+            await _perform(action, success)
         finally:
             self.is_busy = False
             await asyncio.sleep(0)
@@ -1833,6 +1857,12 @@ class GameReader:
 
     async def step(self) -> None:
         await self._operate(lambda: self.platform.step_game(self.game_id))
+
+    async def synchronise_controls(self) -> None:
+        await self._operate(
+            lambda: self.platform.games.synchronise_controls(self.game_id),
+            '已核对叙事时空，游戏保持暂停',
+        )
 
     async def toggle_run(self) -> None:
         game = self.platform.get_game(self.game_id)

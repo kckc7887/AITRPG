@@ -93,7 +93,41 @@ SKILL_BASES = {
     '催眠': 1,
     '炮术': 1,
 }
+SCIENCE_SPECIALIZATIONS = {
+    '天文学',
+    '生物学',
+    '植物学',
+    '化学',
+    '密码学',
+    '地质学',
+    '药剂学',
+    '物理学',
+    '动物学',
+}
 SKILL_ALIASES = {
+    '力量': 'STR',
+    '体质': 'CON',
+    '体型': 'SIZ',
+    '敏捷': 'DEX',
+    '外貌': 'APP',
+    '智力': 'INT',
+    '意志': 'POW',
+    '意志力': 'POW',
+    '教育': 'EDU',
+    '教育程度': 'EDU',
+    'strength': 'STR',
+    'constitution': 'CON',
+    'size': 'SIZ',
+    'dexterity': 'DEX',
+    'appearance': 'APP',
+    'intelligence': 'INT',
+    'power': 'POW',
+    'education': 'EDU',
+    '药学': '科学：药剂学',
+    '药剂学': '科学：药剂学',
+    '科学：药学': '科学：药剂学',
+    'pharmacy': '科学：药剂学',
+    'science (pharmacy)': '科学：药剂学',
     '图书馆': '图书馆使用',
     '斗殴': '格斗：斗殴',
     '手枪': '射击：手枪',
@@ -364,9 +398,16 @@ def skill_value(character: Character, skill: str) -> int:
         return character.luck
     if key.lower() in ('san', '理智', 'sanity'):
         return character.current_san
-    if key not in character.skills:
-        raise ValueError(f'角色没有技能：{key}')
-    return character.skills[key]
+    if key in character.skills:
+        return character.skills[key]
+    for saved_name, value in character.skills.items():
+        if normalize_skill(saved_name) == key:
+            return value
+    if key in SKILL_BASES or key in ('闪避', '母语'):
+        return base_skill(key, character.attributes)
+    if key.startswith('科学：') and key[3:] in SCIENCE_SPECIALIZATIONS:
+        return 1
+    raise ValueError(f'角色没有技能：{key}')
 
 
 def skill_check(
@@ -457,11 +498,16 @@ def weapon_damage(
         return result
     maximum_weapon = roll_dice(expression, rng=MaximumDice())
     if is_impaling:
-        # 贯穿的伤害加值仍投骰，不能照搬钝器的最大伤害加值。
-        extra = roll_dice(f'({expression})+({damage_bonus})', rng=rng)
-        extra.total = max(0, extra.total + maximum_weapon.total)
+        maximum_bonus = roll_dice(damage_bonus, rng=MaximumDice())
+        fixed = maximum_weapon.total + maximum_bonus.total
+        extra = roll_dice(f'({expression})+({fixed})', rng=rng)
+        extra.total = max(0, extra.total)
         extra.details.update(
-            {'is_impaling': True, 'maximum_weapon': maximum_weapon.total}
+            {
+                'is_impaling': True,
+                'maximum_weapon': maximum_weapon.total,
+                'maximum_damage_bonus': maximum_bonus.total,
+            }
         )
         return extra
     maximum = roll_dice(f'({expression})+({damage_bonus})', rng=MaximumDice())
@@ -742,6 +788,7 @@ def _sanity(
     day: int,
     rng: Any,
     rolls: list[Roll],
+    sanity_roll: Roll | None = None,
 ) -> dict:
     runtime = _runtime(character)
     if runtime.get('san_day') != day:
@@ -752,24 +799,42 @@ def _sanity(
                 'san_day_loss': 0,
             }
         )
-    check = skill_check(character, 'SAN', rng=rng)
-    rolls.append(check)
+    if sanity_roll is None:
+        check = skill_check(character, 'SAN', rng=rng)
+        rolls.append(check)
+    else:
+        if (
+            str(sanity_roll.details.get('skill', '')).lower()
+            not in ('san', '理智', 'sanity')
+            or not 1 <= sanity_roll.total <= 100
+        ):
+            raise ValueError('复用理智检定须由服务器提供有效SAN骰')
+        check = sanity_roll
     key = 'success_loss' if check.details['is_success'] else 'failure_loss'
-    loss_roll = roll_dice(str(parameters.get(key, '0')), rng=rng)
+
+    class MaximumDice:
+        def randint(self, minimum, maximum):
+            return maximum
+
+    maximized = check.details['level'] == 'fumble' and key == 'failure_loss'
+    loss_roll = roll_dice(
+        str(parameters.get(key, '0')),
+        rng=MaximumDice() if maximized else rng,
+    )
     if loss_roll.total < 0:
         raise ValueError('理智损失不能为负数')
-    if check.details['level'] == 'fumble' and key == 'failure_loss':
-        terms = loss_roll.details['terms']
-        if len(terms) == 1 and re.fullmatch(
-            r'\d*[dD]\d+', loss_roll.expression
-        ):
-            loss_roll.total = terms[0]['count'] * terms[0]['sides']
-            loss_roll.details['is_maximized'] = True
+    if maximized:
+        loss_roll.details['is_maximized'] = True
     rolls.append(loss_roll)
     loss = min(character.current_san, loss_roll.total)
     character.current_san -= loss
     runtime['san_day_loss'] += loss
-    result = {'san_loss': loss, 'is_involuntary': loss > 0}
+    result = {
+        'san_loss': loss,
+        'is_involuntary': loss > 0,
+        'sanity_check_id': check.id,
+        'sanity_check_reused': sanity_roll is not None,
+    }
     if loss >= 5:
         intelligence = skill_check(character, 'INT', rng=rng)
         rolls.append(intelligence)
@@ -909,6 +974,7 @@ def apply_command(
     day: int = 0,
     rng: Any = None,
     healer: Character | None = None,
+    sanity_roll: Roll | None = None,
 ) -> tuple[Character, list[Roll], dict]:
     updated = character.model_copy(deep=True)
     rolls = []
@@ -923,7 +989,27 @@ def apply_command(
         armor = _integer(parameters.get('armor', 0), '护甲')
         info.update(_damage(updated, max(0, amount - armor), rng, rolls))
     elif kind in ('sanity', 'san'):
-        info.update(_sanity(updated, parameters, day, rng, rolls))
+        info.update(_sanity(updated, parameters, day, rng, rolls, sanity_roll))
+    elif kind == 'gain_sanity':
+        if (
+            'permanent_insanity' in updated.conditions
+            or updated.current_san == 0
+        ):
+            raise ValueError('永久疯狂不能通过普通理智奖励恢复')
+        runtime = _runtime(updated)
+        if runtime.get('san_day') != day:
+            runtime.update(
+                {
+                    'san_day': day,
+                    'san_day_start': updated.current_san,
+                    'san_day_loss': 0,
+                }
+            )
+        amount = _amount(parameters, rng=rng, rolls=rolls)
+        maximum = max(0, 99 - updated.skills.get('克苏鲁神话', 0))
+        gained = min(amount, max(0, maximum - updated.current_san))
+        updated.current_san += gained
+        info.update({'san_gain': gained, 'requested_gain': amount})
     elif kind == 'heal':
         info.update(_heal(updated, parameters, rng, rolls, healer))
     elif kind == 'recover':
@@ -943,12 +1029,15 @@ def apply_command(
             info.update(_damage(updated, deficit, rng, rolls))
     elif kind == 'mark_skill':
         skill = normalize_skill(parameters.get('skill', ''))
-        skill_value(updated, skill)
+        value = skill_value(updated, skill)
         if (
-            skill in updated.skills
+            skill.upper() not in ATTRIBUTE_NAMES
+            and skill.lower()
+            not in ('san', '理智', 'sanity', 'luck', '幸运', '运气')
             and skill not in ('克苏鲁神话', '信用评级')
             and skill not in updated.skill_marks
         ):
+            updated.skills.setdefault(skill, value)
             updated.skill_marks.append(skill)
     elif kind in ('grow', 'growth'):
         requested = parameters.get('skills', list(updated.skill_marks))

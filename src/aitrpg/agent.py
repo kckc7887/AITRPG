@@ -18,9 +18,11 @@ from mcp.shared.exceptions import MCPError
 
 from aitrpg.adapters.mcp_server import tool_payload
 from aitrpg.adapters.providers import ProviderClient
+from aitrpg.application.games import CONTROL_INSTRUCTION
 from aitrpg.application.games import KEEPER_INSTRUCTION
 from aitrpg.application.games import PLAYER_INSTRUCTION
 from aitrpg.config import environment_value
+from aitrpg.domain.models import KeeperControl
 from aitrpg.domain.models import KeeperResponse
 from aitrpg.domain.models import PlayerResponse
 from aitrpg.domain.models import Provider
@@ -131,6 +133,18 @@ async def run_agent(
                             if is_keeper
                             else PLAYER_INSTRUCTION
                         )
+                        if is_keeper and work['purpose'] == 'keeper_control':
+                            output_type = KeeperControl
+                            instruction = CONTROL_INSTRUCTION
+                        if is_keeper and work['purpose'] == 'keeper_repair':
+                            from aitrpg.application.ruling_repair import (
+                                scoped_repair_type,
+                            )
+
+                            output_type = scoped_repair_type(
+                                work['context'].get('allowed_attacker_id'),
+                                work['context'].get('is_attack_allowed', True),
+                            )
                         result = await generator.generate(
                             provider,
                             instruction,

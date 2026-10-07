@@ -304,6 +304,15 @@ def test_docx_table_and_xlsx_formula_are_preserved_without_execution(
     assert formula.locator.endswith(':B1')
 
 
+@pytest.mark.parametrize('name', ['NUL.txt', '.. /outside.txt', 'notes.'])
+def test_archive_rejects_windows_path_aliases(tmp_path: Path, name: str):
+    archive_path = tmp_path / 'aliases.zip'
+    with zipfile.ZipFile(archive_path, 'w') as archive:
+        archive.writestr(name, '应保留的原文')
+    with pytest.raises(AttachmentError, match='路径'):
+        unpack_archive(archive_path, tmp_path / 'output')
+
+
 def test_archive_rejects_traversal_links_and_size_limits(tmp_path: Path):
     archive_path = tmp_path / 'unsafe.zip'
     with zipfile.ZipFile(archive_path, 'w') as archive:

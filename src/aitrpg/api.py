@@ -159,6 +159,10 @@ def register_api(app: FastAPI, platform: Platform):
     async def finish_game(game_id: str):
         return await platform.games.finish(game_id)
 
+    @app.post('/api/v1/games/{game_id}/synchronise')
+    async def synchronise_game(game_id: str):
+        return await platform.games.synchronise_controls(game_id)
+
     @app.post('/api/v1/games/{game_id}/intervene')
     async def intervene(game_id: str, request: Intervention):
         return await platform.intervene(game_id, **request.model_dump())

@@ -6,6 +6,8 @@ import hashlib
 import json
 import math
 import mimetypes
+import os
+import re
 import secrets
 from datetime import timedelta
 from pathlib import Path
@@ -13,14 +15,19 @@ from pathlib import Path
 from PIL import Image
 from PIL import ImageDraw
 
+from aitrpg.adapters.process import is_process_alive
+from aitrpg.adapters.providers import ProviderError
 from aitrpg.adapters.storage import ConflictError
 from aitrpg.domain.models import Actor
 from aitrpg.domain.models import Character
 from aitrpg.domain.models import Game
 from aitrpg.domain.models import Invitation
+from aitrpg.domain.models import KeeperControl
 from aitrpg.domain.models import KeeperResponse
 from aitrpg.domain.models import PlayerResponse
 from aitrpg.domain.models import Provider
+from aitrpg.domain.models import Roll
+from aitrpg.domain.models import RulingRepair
 from aitrpg.domain.models import Scenario
 from aitrpg.domain.models import Seat
 from aitrpg.domain.models import new_id
@@ -29,45 +36,98 @@ from aitrpg.domain.privacy import retrieve_sources
 from aitrpg.domain.privacy import scenario_for_viewer
 from aitrpg.domain.rules import apply_command
 from aitrpg.domain.rules import derived_character
+from aitrpg.domain.rules import normalize_skill
 from aitrpg.domain.rules import opposed_result
 from aitrpg.domain.rules import skill_check
+from aitrpg.domain.rules import skill_value
 from aitrpg.domain.scheduler import record_selection
 from aitrpg.domain.scheduler import select_actors
 from aitrpg.domain.scheduler import select_group
 
 PLAYER_INSTRUCTION = (
     '你是CoC7调查员，只根据本人角色、可见记录和现场行动。'
+    'self_character_id与self_character_name明确指定本人；'
+    '不要把别人的姓名、职业或台词当成自己。'
     '认真扮演背景、动机与关系。不要假装知道未提供的剧本秘密。'
+    '当前共同目标以实际开场与已获信息为准，背景旧案不会自动变成本团主线。'
     '台词写speech，具体行动写intent；有必要可观察或让出机会。'
+    '参照最新记录，已完成的提问或动作不要原样再提交。'
     '不得自行投骰、宣称检定结果或修改状态。'
     '意图默认只给主持，公开行动可设intent_visibility=public。'
     '防御邀请时选择defense=dodge/fight_back/cover。'
 )
 KEEPER_INSTRUCTION = (
     '你是CoC7主持人。保留模组核心真相，允许合理即兴并记录improvisation。'
+    '即兴仅补足对白、环境和衔接，不能添加新的主要秘密、雇主任务或'
+    '核心对手去替代原作主线。原作没有关键线索的准备地点应适时离开。'
     '公平安排不同数量和组合的调查员，避免机械车轮。'
+    '玩家台词和行动按actor_id映射到对应角色，不能代演未受邀者的重大行动。'
+    'is_all_players仅用于必须全员参与的检定或决定，'
+    '普通介绍、多人在场和分头探索不要设为true。'
     '检查只填写checks，平台会给真实结果；未知结果前不要叙述成功或失败。'
     '普通状态用commands请求，所有骰点和计算由平台执行。'
     '公开narration不能包含主持专用资料、非现场角色的秘密或私密判定。'
+    '各人的HO和秘密导入放private_messages，以actor_id为键分别发送；'
+    '不能把多个HO放在同一narration中向现场公开。'
     '命令参数：damage(amount,armor=0)、sanity(success_loss,failure_loss)、'
     'heal(source=first_aid或medicine,wound_id可选)、'
     '治疗别人时附healer_id，使用治疗者真实技能；heal只操作调查员卡。'
     'NPC治疗申请医生check医学，再用flags记录主持裁定的NPC后果。'
     'recover(hours=0,days=0)、grow(skills列表)、'
+    'gain_sanity(amount整数或安全骰式，结局或明确规则奖励)、'
     'spend_mp(amount)、condition(name,is_present布尔)、'
     'add_item(item对象)、remove_item(item_id)、mark_skill(skill)、'
     'background(updates对象)、custom(changes对象，须有裁定依据)。'
     '場景切换使用scene_id；split_groups的groups为组名到actor_id列表。'
+    '各队处于不同场景时，split_groups另填group_scenes的组名到scene_id。'
     'start_combat的npcs条目必须有id,name,dex,hp,fighting,dodge,damage,armor；'
     '并提供source_id或明确improvisation，readied_guns列出已准备枪械角色卡id。'
     'combat_attack参数attacker_id,target_id,weapon_index,mode=melee或firearm；'
     '玩家伤害技能来自真实角色卡，不传weapon_damage或替玩家选defense。'
     '战斗行动顺序由平台规定，NPC不能凭空改变调查员行动次数。'
+    '只结算combat_turn当前行动；被拒的攻击没有排队或产生效果。'
+    '本轮实际攻击必须提交新的combat_attack，不能仅靠flags或台词声称已打。'
+    'NPC攻防走combat_attack，不放进仅支持调查员的opponent_character_id。'
     '结束用end_combat。结束模组时is_finished=true且说明ending。'
     '场景只选scene_catalog已列id，邀请使用actor_id，检定使用character_id。'
     '时间用advance_hours/advance_days推进，平台自动处理自然恢复；'
+    'narration中发生跨夜、出发、到达或耗时调查，必须同步填写时间与scene_id；'
+    '不能仅用台词声称已过夜或到新地点却把结构化状态留在原处。'
     '不重复发同一时段recover。'
     '必须根据真实调查进度推进，不需要逐字复演书面时长。'
+    '成功检定后兑现模组规定的信息，不重复考验已完成条件。'
+    '不能临时添加永远无法通过的行政或权限障碍阻塞原有线索。'
+    '场景目标满足后收束对话，提供明确下一步并推进实际时间/场景。'
+    '同一问题已有答复时提示既有答案，避免让角色反复核验相同细节。'
+    '观察、警戒、等候应在合理耗时后产生新情况或明确无发现，'
+    '不得逐节点重复同一静止画面且保持时钟不变。'
+    'scene_id表示实际所在场景，准备去、指图或讨论路线不算到达。'
+    '查看scheduled_events里的原有事件条件。玩家持续等待时，'
+    '处理到下一实际变化或原定事件，不能只重复无变化的观察。'
+    '不要因为略过白天或守夜而漏掉模组核心定时事件。'
+    '事件确因玩家选择未发生时，记录条件和原因，保留核心真相。'
+    'NPC及环境按原条件自然行动，玩家观察不等于世界静止。'
+    '原文规定的NPC意外和环境后果不能因玩家被动而取消，'
+    '满足条件时落实世界事件，再让玩家选择应对，不代选角色行动。'
+)
+CONTROL_INSTRUCTION = (
+    '你仍是本局主持，核对已完成叙事与游戏控制状态。'
+    '不新增情节或角色行动，不重新检定。未来约定不算已发生。'
+    '输出绝对target_day/target_hour，由引擎算增量。'
+    'day从0起算，第1天=0，第二天=1。current是唯一实际存档时刻。'
+    'previous只是未执行且被拒绝的候选，不能当已发生状态。'
+    'unchanged须与current比较；之前叙事漏记的已发生时间仍须同步。'
+    '只能选目录中的scene_id，复合旅行场景可包含其原文地点。'
+    '已有叙事仅把同一段旅行的交通方式作合理即兴调整时，'
+    '仍可对应原旅行场景，在reason注明差异，不能对应终局撤离。'
+    '核对剧情阶段、行进方向与场景前提，不能仅凭同名地点匹配。'
+    '场景的核心遭遇实际未发生时，不能自行称作该场景入口来匹配；'
+    '讨论图上的目的地仍是当前旅行阶段，不代表已到目的地。'
+    '每项变更给连续逐字原句quote，不得拼接或用省略号代替原文。'
+    '不能把原作时长当实际耗时。'
+    '精确时间用supported；只有大约耗时且允许估计时，'
+    '由守秘人裁定合理分钟，标estimated并解释。'
+    '无变化用unchanged，资料不足且不能裁定用needs_review。'
 )
 
 
@@ -81,7 +141,12 @@ class GameService:
         self._signals: dict[str, asyncio.Event] = {}
         self._offline: dict[str, set[str]] = {}
         for record in self.store.list('game'):
-            if record['status'] in {'running', 'waiting'}:
+            if record['status'] in {
+                'running',
+                'waiting',
+            } and not is_process_alive(
+                record.get('scheduler', {}).get('runner_pid', 0)
+            ):
                 record['status'] = 'paused'
                 record['last_error'] = '服务重新启动，已保留进度，请继续游戏'
                 self.store.put('game', record['id'], record)
@@ -223,6 +288,10 @@ class GameService:
             revealed_ids=known + visible_assets,
             scene_id=viewed_scene,
         )
+        if not is_keeper:
+            scenario_view.pop('description', None)
+            for scene in scenario_view['scenes']:
+                scene.pop('public_text', None)
         cards = []
         for character in self._characters(game):
             if is_keeper or character.actor_id == actor_id:
@@ -254,7 +323,9 @@ class GameService:
             )
         invitations = [
             item
-            for item in self.store.list('invitation')
+            for item in self.store.list(
+                'invitation', game_id=game.id, statuses=['pending', 'claimed']
+            )
             if item['game_id'] == game.id
             and item['status'] in {'pending', 'claimed'}
             and (is_keeper or item['actor_id'] == actor_id)
@@ -301,8 +372,108 @@ class GameService:
     def context(self, game: Game, actor_id: str, purpose: str, extra=None):
         context = self.view(game.id, actor_id)
         context['task'] = purpose
+        own_seat = next(
+            (seat for seat in game.seats if seat.actor_id == actor_id), None
+        )
+        context['self_actor_id'] = actor_id
+        if own_seat:
+            own = next(
+                card
+                for card in context['characters']
+                if card['id'] == own_seat.character_id
+            )
+            context['self_character_id'] = own['id']
+            context['self_character_name'] = own['name']
+        for card in context['characters']:
+            for key in (
+                'creation_rolls',
+                'allocations',
+                'occupation_definition',
+                'source',
+                'import_warnings',
+                'created_at',
+                'locked_game_id',
+            ):
+                card.pop(key, None)
         context['actor_ids'] = [seat.actor_id for seat in game.seats]
         context['events'] = context['events'][-32:]
+        history = self._visible_events(game, actor_id)
+        recent_ids = {event['id'] for event in context['events']}
+        older = [
+            event
+            for event in history
+            if event['id'] not in recent_ids
+            and event['kind'] in {'narration', 'check', 'ruling'}
+        ]
+        scene = next(
+            (
+                scene
+                for scene in self.scenario(game).scenes
+                if scene.id == game.scene_id
+            ),
+            None,
+        )
+        query = (
+            (scene.title + ' ' + scene.public_text) if scene else game.scene_id
+        )
+        words = set(
+            re.findall(r'[\u4e00-\u9fff]{2}|[A-Za-z]{3,}', query.lower())
+        )
+        ranked = sorted(
+            older,
+            key=lambda event: sum(
+                str(event['data']).lower().count(word) for word in words
+            ),
+            reverse=True,
+        )
+        context['earlier_known_records'] = [
+            {
+                'sequence': event['sequence'],
+                'kind': event['kind'],
+                'content': str(event['data'])[:1200],
+            }
+            for event in ranked[:6]
+        ]
+        if actor_id == game.keeper_actor_id:
+            holds = game.scheduler.get('scene_nodes', {})
+            count = holds.get(game.scene_id, 0)
+            context['pacing'] = {
+                'nodes_in_current_scene': count,
+                'scene_goal': scene.keeper_text[:4000] if scene else '',
+                'directive': (
+                    '本场景已持续多个节点，请明确未完成目标。'
+                    '已取得的信息不要重复扣住；若原条件满足，'
+                    '收束并开放下一场景，继续真实剧情与时间。'
+                )
+                if count >= 6
+                else '围绕具体调查目标推进。',
+            }
+            scenario = self.scenario(game)
+            context['scheduled_events'] = [
+                {
+                    'scene_id': item.id,
+                    'title': item.title,
+                    'conditions': item.conditions,
+                    'goal': item.keeper_text[:1200],
+                    'settled_nodes': holds.get(item.id, 0),
+                }
+                for item in scenario.scenes
+                if any(
+                    key in item.conditions
+                    for key in ('time', 'trigger', 'requires', 'event')
+                )
+            ]
+            context['next_scene_options'] = [
+                {
+                    'id': item.id,
+                    'title': item.title,
+                    'conditions': item.conditions,
+                    'goal': item.keeper_text,
+                    'read_aloud_candidate': item.public_text,
+                }
+                for item in scenario.scenes
+                if scene and item.id in scene.next_scene_ids
+            ]
         for asset in context['assets']:
             asset.pop('url', None)
         if actor_id == game.keeper_actor_id:
@@ -331,19 +502,43 @@ class GameService:
                 limit=8,
                 max_chars=18000,
             )
+            context['related_source_evidence'] = retrieve_sources(
+                scenario, query, is_keeper=True, limit=6, max_chars=8000
+            )
+            context['ending_rules_evidence'] = retrieve_sources(
+                scenario,
+                '结局 结束 返航 ending finale',
+                is_keeper=True,
+                limit=12,
+                max_chars=12000,
+            )
             context['scenario'].pop('source_blocks', None)
             context['scenario'].pop('directory', None)
-            catalog = context['scenario'].get('scenes', [])
+            context['scenario'].pop('source_index', None)
+            catalog = [
+                scene.model_dump(mode='json') for scene in scenario.scenes
+            ]
             context['scene_catalog'] = [
                 {
                     'id': item['id'],
                     'title': item['title'],
                     'next_scene_ids': item.get('next_scene_ids', []),
+                    'participants': item.get('conditions', {}).get(
+                        'participants', []
+                    ),
                 }
                 for item in catalog
             ]
             context['scenario']['scenes'] = [
                 item for item in catalog if item['id'] == game.scene_id
+            ]
+            context['scenario']['endings'] = [
+                {
+                    'id': ending.id,
+                    'title': ending.title,
+                    'text': ending.text[:2200],
+                }
+                for ending in scenario.endings
             ]
             for collection in ('npcs', 'clues', 'handouts'):
                 items = context['scenario'].get(collection, [])
@@ -357,18 +552,25 @@ class GameService:
                 for item in context['scenario'].get(collection, []):
                     for key in ('text', 'keeper_text', 'secret_text'):
                         if isinstance(item.get(key), str):
-                            item[key] = item[key][:6000]
+                            limit = 5000 if collection == 'scenes' else 2200
+                            text = item[key]
+                            item[key] = (
+                                text
+                                if len(text) <= limit
+                                else text[: limit - 500]
+                                + '\n[部分省略]\n'
+                                + text[-500:]
+                            )
         if extra:
             context.update(extra)
-        actor = self.store.get('actor', actor_id)
-        provider_data = (
-            self.store.get('provider', actor.get('provider_id'))
-            if actor and actor.get('provider_id')
-            else None
-        )
-        if provider_data and provider_data.get('is_vision'):
+        return context
+
+    def _model_context(self, game, actor_id, provider, context):
+        context = dict(context)
+        context.pop('_images', None)
+        if provider.is_vision:
             scenario = self.scenario(game)
-            visible_ids = {asset['id'] for asset in context['assets']}
+            visible_ids = {asset['id'] for asset in context.get('assets', [])}
             relevant = [
                 asset
                 for asset in scenario.assets
@@ -413,6 +615,89 @@ class GameService:
             key: value for key, value in positions.items() if key in visible
         }
 
+    def _narration_audience(self, game, reply, *, is_opening=False):
+        actors = reply.recipient_actor_ids or self._group_actor_ids(game)
+        if not set(actors).issubset({seat.actor_id for seat in game.seats}):
+            raise ValueError('秘密消息接收者不在游戏中')
+        if is_opening and not set(actors).issubset(
+            self._group_actor_ids(game)
+        ):
+            raise ValueError('开场受众不能超出原镜头授权成员')
+        if not set(reply.private_messages).issubset(
+            {seat.actor_id for seat in game.seats}
+        ):
+            raise ValueError('私密消息接收者不在游戏中')
+        return actors
+
+    def _account_usage(self, game_id, usage):
+        if not usage:
+            return
+        with self.store.transaction() as transaction:
+            latest = transaction.get('game', game_id)
+            latest['token_usage'] += usage
+            transaction.put('game', game_id, latest)
+
+    def _validate_narration(self, game, reply, *, is_opening=False):
+        scenario = self.scenario(game)
+        public_audience = self._narration_audience(
+            game, reply, is_opening=is_opening
+        )
+        audiences = [(reply.narration, public_audience)]
+        audiences.extend(
+            (message, [actor_id])
+            for actor_id, message in reply.private_messages.items()
+        )
+        records = self.store.events(game.id)
+
+        def fragments(text):
+            cleaned = re.sub(r'[^\w\u4e00-\u9fff]', '', text).lower()
+            return {
+                cleaned[index : index + 16]
+                for index in range(max(0, len(cleaned) - 15))
+            }
+
+        public = ''.join(role.public_text for role in scenario.roles)
+        for narration, actor_ids in audiences:
+            proposed = fragments(narration)
+            for actor_id in actor_ids:
+                seat = next(
+                    seat for seat in game.seats if seat.actor_id == actor_id
+                )
+                known = public + ''.join(
+                    event['data'].get('text', event['data'].get('speech', ''))
+                    for event in records
+                    if not event['is_private']
+                    and (
+                        not event['actor_ids']
+                        or actor_id in event['actor_ids']
+                    )
+                )
+                known_ids = set(game.knowledge.get(actor_id, []))
+                if actor_id in public_audience:
+                    known_ids.update(reply.reveal_clue_ids)
+                known += ''.join(
+                    clue.text
+                    for clue in scenario.clues
+                    if clue.id in known_ids
+                )
+                allowed = fragments(known)
+                for role in scenario.roles:
+                    if role.id == seat.role_id:
+                        continue
+                    if proposed & fragments(role.secret_text) - allowed:
+                        raise ValueError(
+                            '主持叙事包含未获授权的身份秘密：' + role.id
+                        )
+                for scene in scenario.scenes:
+                    participants = scene.conditions.get('participants', [])
+                    if not participants or (
+                        seat.role_id in participants
+                        or actor_id in participants
+                    ):
+                        continue
+                    if proposed & fragments(scene.public_text) - allowed:
+                        raise ValueError('主持叙事包含未授权的单人场景读白')
+
     async def _invoke(self, game, actor_id, purpose, output_type, extra=None):
         cycle = self._cycle(game)
         key = f'{purpose}:{actor_id}'
@@ -436,6 +721,12 @@ class GameService:
                 },
             )
         if not invitation or invitation.expires_at <= utc_now():
+            invitation_context = (
+                dict(extra or {})
+                if purpose == 'keeper_control'
+                else self.context(game, actor_id, purpose, extra)
+            )
+            invitation_context['task'] = purpose
             invitation = Invitation(
                 game_id=game.id,
                 actor_id=actor_id,
@@ -452,7 +743,7 @@ class GameService:
                 scene_id=game.scene_id,
                 expires_at=utc_now()
                 + timedelta(seconds=self.platform.settings.invitation_seconds),
-                context=self.context(game, actor_id, purpose, extra),
+                context=invitation_context,
             )
             cycle['invitations'][key] = invitation.id
             self.store.put('cycle', game.id, cycle)
@@ -487,12 +778,60 @@ class GameService:
             if actor_id == game.keeper_actor_id
             else PLAYER_INSTRUCTION
         )
-        result = await self.platform.provider_client.generate(
-            provider,
-            instruction + '\n表演风格：' + actor.style,
-            invitation.context,
-            output_type,
+        if purpose == 'keeper_control':
+            instruction = CONTROL_INSTRUCTION
+        request_context = self._model_context(
+            game, actor_id, provider, invitation.context
         )
+        repair = ''
+        for attempt in range(2):
+            invitation.expires_at = utc_now() + timedelta(
+                seconds=provider.timeout_seconds * 4 + 10
+            )
+            self.store.put(
+                'invitation',
+                invitation.id,
+                invitation.model_dump(mode='json'),
+            )
+            try:
+                result = await self.platform.provider_client.generate(
+                    provider,
+                    instruction + '\n表演风格：' + actor.style + repair,
+                    request_context,
+                    output_type,
+                )
+            except ProviderError as error:
+                self._account_usage(
+                    game.id, error.diagnostics.get('total_usage', 0)
+                )
+                self.store.put(
+                    'provider_failure',
+                    invitation.id,
+                    {
+                        'game_id': game.id,
+                        'invitation_id': invitation.id,
+                        'purpose': purpose,
+                        'diagnostics': error.diagnostics,
+                    },
+                )
+                raise
+            self._account_usage(game.id, result.usage)
+            if output_type is not KeeperResponse:
+                break
+            try:
+                self._validate_narration(
+                    game, result.value, is_opening=purpose == 'keeper_opening'
+                )
+                break
+            except ValueError as error:
+                if attempt:
+                    raise
+                repair = (
+                    '\n上次公开输出未获授权：'
+                    + str(error)
+                    + '。仅向本人private_messages发送秘密，'
+                    '公开叙事改为现场实际可知内容，不改变玩家行动或骰点。'
+                )
         current = self.get(game.id)
         if current.revision != invitation.revision:
             raise ConflictError('生成期间游戏已被修正，旧回复已作废')
@@ -503,10 +842,6 @@ class GameService:
             actor_id,
             source_fields=list(result.value.model_fields_set),
         )
-        with self.store.transaction() as transaction:
-            latest = transaction.get('game', game.id)
-            latest['token_usage'] += result.usage
-            transaction.put('game', game.id, latest)
         return result.value
 
     def submit(
@@ -541,10 +876,22 @@ class GameService:
             ):
                 raise ValueError('发言邀请已经过期或失效')
             response_type = (
-                KeeperResponse
+                (
+                    {
+                        'keeper_control': KeeperControl,
+                        'keeper_repair': RulingRepair,
+                    }.get(invitation.purpose, KeeperResponse)
+                )
                 if actor_id == game.keeper_actor_id
                 else PlayerResponse
             )
+            if invitation.purpose == 'keeper_repair':
+                from aitrpg.application.ruling_repair import scoped_repair_type
+
+                response_type = scoped_repair_type(
+                    invitation.context.get('allowed_attacker_id'),
+                    invitation.context.get('is_attack_allowed', True),
+                )
             parsed = response_type.model_validate(response)
             invitation.response = parsed.model_dump(mode='json')
             invitation.status = 'submitted'
@@ -611,6 +958,7 @@ class GameService:
                 return game
             self._steps[identifier] = asyncio.current_task()
             game.status = 'running'
+            game.scheduler['runner_pid'] = os.getpid()
             game.last_error = ''
             self.store.put('game', game.id, game.model_dump(mode='json'))
             try:
@@ -626,6 +974,7 @@ class GameService:
                         )
                     return await self._finish_work(game, work, is_automatic)
                 if not game.last_keeper:
+                    opening_audience = self._group_actor_ids(game)
                     opening = await self._invoke(
                         game,
                         game.keeper_actor_id,
@@ -634,10 +983,13 @@ class GameService:
                         {
                             'instruction': (
                                 '开场介绍现场，邀请调查员。'
+                                '落实原文可公开的入场关系、委托或共同目标，'
+                                '让角色知道为何在此参与；不提前揭示未来真相。'
                                 '不要提前解决其行动。'
                             )
                         },
                     )
+                    self._validate_narration(game, opening, is_opening=True)
                     game.last_keeper = opening.model_dump(mode='json')
                     game.next_actor_ids = opening.invite_actor_ids
                     game.is_all_players = opening.is_all_players
@@ -650,11 +1002,22 @@ class GameService:
                         or opening.is_finished
                     ):
                         cycle = self._cycle(game)
-                        cycle.update(selected=[], eligible=[], groups=[])
+                        cycle.update(
+                            selected=[],
+                            eligible=[],
+                            groups=[],
+                            is_opening=True,
+                        )
                         work = await self._prepare_work(
                             game, opening, [], cycle
                         )
-                        self.store.put('resolution_work', game.id, work)
+                        self.store.put(
+                            'control_work'
+                            if work.get('force')
+                            else 'resolution_work',
+                            game.id,
+                            work,
+                        )
                         return await self._finish_work(
                             game, work, is_automatic
                         )
@@ -663,8 +1026,23 @@ class GameService:
                             game.id,
                             'narration',
                             {'text': opening.narration},
-                            actor_ids=self._group_actor_ids(game),
+                            actor_ids=(
+                                opening.recipient_actor_ids or opening_audience
+                            ),
+                            is_private=not (
+                                opening.recipient_actor_ids or opening_audience
+                            ),
                         )
+                        for (
+                            actor_id,
+                            message,
+                        ) in opening.private_messages.items():
+                            transaction.append_event(
+                                game.id,
+                                'narration',
+                                {'text': message},
+                                actor_ids=[actor_id],
+                            )
                         latest = self.get(game.id)
                         game.token_usage = latest.token_usage
                         transaction.put(
@@ -713,7 +1091,11 @@ class GameService:
                     },
                 )
                 work = await self._prepare_work(game, reply, submitted, cycle)
-                self.store.put('resolution_work', game.id, work)
+                self.store.put(
+                    'control_work' if work.get('force') else 'resolution_work',
+                    game.id,
+                    work,
+                )
                 return await self._finish_work(game, work, is_automatic)
             except asyncio.CancelledError:
                 paused = self.get(identifier)
@@ -779,6 +1161,8 @@ class GameService:
             return selected, selected, groups
         scenes = game.scheduler.setdefault('group_scenes', {})
         scenes[game.group_id] = game.scene_id
+        for group_id in groups:
+            scenes.setdefault(group_id, game.scene_id)
         game.group_id = select_group(game, groups)
         game.scene_id = scenes.get(game.group_id, game.scene_id)
         eligible = [
@@ -810,7 +1194,106 @@ class GameService:
         if scene_id not in {scene.id for scene in self.scenario(game).scenes}:
             raise ValueError('主持选择了不存在的场景')
 
+    @staticmethod
+    def _is_repeated_check(check, work):
+        return any(
+            event['kind'] == 'check'
+            and event['data'].get('character_id') == check.character_id
+            and normalize_skill(
+                event['data'].get('details', {}).get('skill', '')
+            )
+            == normalize_skill(check.skill)
+            and event['data'].get('reason', '') == check.reason
+            for event in work['events']
+        )
+
+    def _apply_check(self, game, cards, check, work):
+        if check.character_id not in cards:
+            raise ValueError('检定角色不在游戏中')
+        if check.opponent_character_id:
+            if check.opponent_character_id not in cards:
+                raise ValueError('NPC对抗须用当前轮次combat_attack')
+            skill_value(
+                cards[check.opponent_character_id],
+                check.opponent_skill or check.skill,
+            )
+        canonical = normalize_skill(check.skill)
+        if game.mode == 'combat' and canonical.startswith(
+            ('格斗：', '射击：')
+        ):
+            turn = self._combat_turn(game)
+            if not turn or turn['id'] != check.character_id:
+                raise ValueError('攻击检定只能由当前战斗行动者执行')
+            if any(
+                response.get('actor_id') == cards[check.character_id].actor_id
+                and response.get('is_pass')
+                for response in work['submitted']
+            ):
+                raise ValueError('玩家本轮让出机会，不能代为攻击检定')
+        if check.is_pushed:
+            self._validate_push(game, check)
+        roll = skill_check(
+            cards[check.character_id],
+            check.skill,
+            check.difficulty,
+            check.bonus_dice,
+            is_pushed=check.is_pushed,
+            mode=game.mode,
+            reason=check.reason,
+        )
+        work['events'].append(
+            {
+                'kind': 'check',
+                'data': {
+                    **roll.model_dump(mode='json'),
+                    'character_id': check.character_id,
+                    'scene_id': game.scene_id,
+                    'pushed_from_id': check.pushed_from_id,
+                },
+                'is_private': check.is_private,
+            }
+        )
+        work['has_rolls'] = True
+        if check.opponent_character_id:
+            opponent = cards.get(check.opponent_character_id)
+            if opponent is None:
+                raise ValueError('对抗角色不在游戏中')
+            opposing_roll = skill_check(
+                opponent,
+                check.opponent_skill or check.skill,
+                reason=check.reason,
+            )
+            work['events'].append(
+                {
+                    'kind': 'check',
+                    'data': {
+                        **opposing_roll.model_dump(mode='json'),
+                        'character_id': opponent.id,
+                    },
+                    'is_private': check.is_private,
+                }
+            )
+            winner = opposed_result(roll, opposing_roll)
+            work['events'].append(
+                {
+                    'kind': 'contest',
+                    'data': {
+                        'winner': winner,
+                        'initiator_id': check.character_id,
+                        'opponent_id': opponent.id,
+                        'reason': check.reason,
+                    },
+                    'is_private': check.is_private,
+                }
+            )
+        if roll.details.get('is_success'):
+            card = cards[check.character_id]
+            cards[card.id], _, _ = apply_command(
+                card, 'mark_skill', {'skill': roll.details['skill']}
+            )
+
     async def _prepare_work(self, game, reply, submitted, cycle):
+        reply = self._normalise_control(reply)
         cards = {card.id: card for card in self._characters(game)}
         previous = self.store.get('resolution_work', game.id)
         work = (
@@ -829,6 +1312,7 @@ class GameService:
                 'cycle': cycle,
                 'has_rolls': False,
                 'started_in_combat': game.mode == 'combat',
+                'is_opening': cycle.get('is_opening', False),
                 'audience_actor_ids': self._group_actor_ids(game),
                 'is_prepared': False,
                 'check_index': 0,
@@ -841,92 +1325,107 @@ class GameService:
                 key: Character.model_validate(value)
                 for key, value in work['cards'].items()
             }
+            work['reply'] = reply.model_dump(mode='json')
         self._checkpoint(game, cards, work)
         for check_index, check in enumerate(reply.checks):
             if check_index < work['check_index']:
                 continue
-            if check.character_id not in cards:
-                raise ValueError('检定角色不在游戏中')
-            if check.is_pushed:
-                self._validate_push(game, check)
-            roll = skill_check(
-                cards[check.character_id],
-                check.skill,
-                check.difficulty,
-                check.bonus_dice,
-                is_pushed=check.is_pushed,
-                mode=game.mode,
-                reason=check.reason,
-            )
-            work['events'].append(
-                {
-                    'kind': 'check',
-                    'data': {
-                        **roll.model_dump(mode='json'),
-                        'character_id': check.character_id,
-                        'scene_id': game.scene_id,
-                        'pushed_from_id': check.pushed_from_id,
-                    },
-                    'is_private': check.is_private,
-                }
-            )
-            work['has_rolls'] = True
-            if check.opponent_character_id:
-                opponent = cards.get(check.opponent_character_id)
-                if opponent is None:
-                    raise ValueError('对抗角色不在游戏中')
-                opposing_roll = skill_check(
-                    opponent,
-                    check.opponent_skill or check.skill,
-                    reason=check.reason,
+            event_count = len(work['events'])
+            try:
+                self._apply_check(game, cards, check, work)
+            except ValueError as error:
+                if len(work['events']) != event_count:
+                    raise
+                from aitrpg.application.ruling_repair import repair_check
+
+                await repair_check(
+                    self, game, cards, check, check_index, work, error
                 )
-                work['events'].append(
-                    {
-                        'kind': 'check',
-                        'data': {
-                            **opposing_roll.model_dump(mode='json'),
-                            'character_id': opponent.id,
-                        },
-                        'is_private': check.is_private,
-                    }
-                )
-                winner = opposed_result(roll, opposing_roll)
-                work['events'].append(
-                    {
-                        'kind': 'contest',
-                        'data': {
-                            'winner': winner,
-                            'initiator_id': check.character_id,
-                            'opponent_id': opponent.id,
-                            'reason': check.reason,
-                        },
-                        'is_private': check.is_private,
-                    }
-                )
-            if roll.details.get('is_success'):
-                card = cards[check.character_id]
-                if check.skill in card.skills:
-                    cards[card.id], _, _ = apply_command(
-                        card, 'mark_skill', {'skill': check.skill}
-                    )
             work['check_index'] = check_index + 1
             self._checkpoint(game, cards, work)
         for command_index, command in enumerate(reply.commands):
             if command_index < work['command_index']:
                 continue
-            await self._apply_command(game, cards, command, work)
+            event_count = len(work['events'])
+            try:
+                await self._apply_command(game, cards, command, work)
+            except ValueError as error:
+                if len(work['events']) != event_count:
+                    raise
+                from aitrpg.application.ruling_repair import repair_command
+
+                await repair_command(self, game, cards, command, work, error)
             work['command_index'] = command_index + 1
             self._checkpoint(game, cards, work)
         work['is_prepared'] = True
         self._checkpoint(game, cards, work)
         return work
 
+    def _normalise_control(self, reply):
+        parsed = reply.model_copy(deep=True)
+        commands = []
+        for command in parsed.commands:
+            if command.kind == 'flags' and not command.character_id:
+                flags = command.parameters.get('flags', command.parameters)
+                if not isinstance(flags, dict):
+                    raise ValueError('全局旗标必须是对象')
+                if any(
+                    key in parsed.flags and parsed.flags[key] != value
+                    for key, value in flags.items()
+                ):
+                    raise ValueError('重复的全局旗标值不一致')
+                parsed.flags = {**parsed.flags, **flags}
+                continue
+            if command.kind not in {
+                'advance_hours',
+                'advance_days',
+                'advance_time',
+            }:
+                commands.append(command)
+                continue
+            parameters = command.parameters
+            hours = parameters.get('hours', 0)
+            days = parameters.get('days', 0)
+            if command.kind == 'advance_hours':
+                hours = parameters.get('hours', parameters.get('amount', 0))
+            if command.kind == 'advance_days':
+                days = parameters.get('days', parameters.get('amount', 0))
+            if (
+                parsed.advance_hours
+                and hours
+                and parsed.advance_hours != hours
+            ):
+                raise ValueError('重复的时间推进小时数不一致')
+            if parsed.advance_days and days and parsed.advance_days != days:
+                raise ValueError('重复的时间推进天数不一致')
+            if (
+                hours
+                or command.kind == 'advance_hours'
+                or 'hours' in parameters
+            ):
+                parsed.advance_hours = parsed.advance_hours or hours
+            if days or command.kind == 'advance_days' or 'days' in parameters:
+                parsed.advance_days = parsed.advance_days or days
+        parsed.commands = commands
+        validated = KeeperResponse.model_validate(parsed.model_dump())
+        return KeeperResponse.model_construct(
+            _fields_set=parsed.model_fields_set,
+            **{
+                name: getattr(validated, name)
+                for name in KeeperResponse.model_fields
+            },
+        )
+
     def _checkpoint(self, game, cards, work):
         work['game'] = game.model_dump(mode='json')
         work['cards'] = {
             key: card.model_dump(mode='json') for key, card in cards.items()
         }
-        self.store.put('resolution_work', game.id, work)
+        self.store.put(
+            'control_work' if work.get('force') else 'resolution_work',
+            game.id,
+            work,
+        )
 
     def _validate_push(self, game, check):
         if not check.pushed_from_id:
@@ -957,6 +1456,91 @@ class GameService:
             raise ValueError('同一个失败检定只能孤注一掷一次')
 
     async def _apply_command(self, game, cards, command, work):
+        if command.kind == 'combat_attack':
+            attacker = cards.get(command.parameters.get('attacker_id'))
+            if attacker and any(
+                response.get('actor_id') == attacker.actor_id
+                and response.get('is_pass')
+                for response in work['submitted']
+            ):
+                raise ValueError('玩家本轮让出机会，不能代为主动攻击')
+        sanity_roll = None
+        if command.kind == 'sanity':
+            used = work.setdefault('sanity_uses', {})
+            requested = command.parameters.get(
+                'sanity_check_id', command.parameters.get('check_id')
+            )
+            candidates = [
+                event['data']
+                for event in work['events']
+                if event['kind'] == 'check'
+                and event['data'].get('character_id') == command.character_id
+                and str(
+                    event['data'].get('details', {}).get('skill', '')
+                ).lower()
+                in {'san', 'sanity', '理智'}
+                and event['data']['id'] not in used
+                and (not requested or event['data']['id'] == requested)
+            ]
+            if requested and not candidates:
+                raise ValueError('指定理智检定不存在、归属错误或已消费')
+            if len(candidates) > 1:
+                raise ValueError('多个理智检定须明确sanity_check_id')
+            if candidates:
+                sanity_roll = Roll.model_validate(
+                    {
+                        key: value
+                        for key, value in candidates[0].items()
+                        if key in Roll.model_fields
+                    }
+                )
+        if command.kind == 'condition' and not command.character_id:
+            name = command.parameters.get('name', '')
+            is_present = command.parameters.get('is_present', True)
+            if (
+                not isinstance(name, str)
+                or not name
+                or type(is_present) is not bool
+            ):
+                raise ValueError('全局状态旗标需要名称与布尔值')
+            game.flags[name] = is_present
+            work['events'].append(
+                {
+                    'kind': 'ruling',
+                    'data': {
+                        'command': 'world_condition',
+                        'reason': command.reason,
+                        'details': {name: is_present},
+                        'authority': '主持裁定',
+                    },
+                    'is_private': True,
+                }
+            )
+            return
+        if command.kind == 'custom' and not command.character_id:
+            if 'changes' in command.parameters:
+                raise ValueError('全局裁定不能无角色指定地修改角色状态')
+            note = command.parameters.get('note', command.reason)
+            if not isinstance(note, str) or not note.strip():
+                raise ValueError('全局裁定记录需要文字依据')
+            partial = command.parameters.get('clue_partial')
+            if partial and partial not in {
+                clue.id for clue in self.scenario(game).clues
+            }:
+                raise ValueError('局部线索记录引用不存在的线索')
+            work['events'].append(
+                {
+                    'kind': 'ruling',
+                    'data': {
+                        'reason': command.reason,
+                        'command': 'keeper_note',
+                        'details': command.parameters,
+                        'authority': '主持裁定',
+                    },
+                    'is_private': True,
+                }
+            )
+            return
         if command.kind in {
             'start_combat',
             'end_combat',
@@ -968,6 +1552,20 @@ class GameService:
         if command.character_id not in cards:
             raise ValueError('状态裁定角色不在游戏中')
         card = cards[command.character_id]
+        if command.kind == 'mark_skill' and not command.parameters.get(
+            'skill'
+        ):
+            successful = [
+                event['data']
+                for event in work['events']
+                if event['kind'] == 'check'
+                and event['data'].get('character_id') == card.id
+                and event['data'].get('details', {}).get('is_success')
+            ]
+            marked = [data['details'].get('skill') for data in successful]
+            if marked and all(skill in card.skill_marks for skill in marked):
+                return
+            raise ValueError('成长标记必须指定已成功的技能')
         if command.kind == 'background':
             updates = command.parameters.get('updates', {})
             if not isinstance(updates, dict) or any(
@@ -1020,7 +1618,10 @@ class GameService:
                 command.parameters,
                 day=game.scheduler.get('base_day', 0) + game.day,
                 healer=healer,
+                sanity_roll=sanity_roll,
             )
+            if command.kind == 'sanity' and details.get('sanity_check_id'):
+                work['sanity_uses'][details['sanity_check_id']] = command.id
         cards[card.id] = card
         for roll in rolls:
             work['events'].append(
@@ -1062,57 +1663,38 @@ class GameService:
             for key, value in work['cards'].items()
         }
         reply = KeeperResponse.model_validate(work['reply'])
-        if work['has_rolls']:
-            feedback = await self._invoke(
-                original,
-                original.keeper_actor_id,
-                'keeper_feedback',
-                KeeperResponse,
-                {
-                    'actual_rule_results': work['events'],
-                    'updated_characters': work['cards'],
-                    'pending_narration': reply.narration,
-                    'already_applied_commands': [
-                        command.model_dump(mode='json')
-                        for command in reply.commands
-                    ],
-                    'instruction': (
-                        '根据真实结果完成叙事和后果。已处理命令不要重复，'
-                        '不再请求新检定；新检定留到下一节点。'
-                        '重复裁定引用origin_command_id，不再执行；'
-                        '只提出实际结果带来的新后果。'
-                    ),
-                },
-            )
-            if feedback.checks:
-                raise ValueError(
-                    '结果回填不能重复申请检定，请修正主持提示后重试'
+        repairs = work.get('command_repairs', {})
+        completed = [
+            command
+            for key, record in repairs.items()
+            if key.startswith('check:')
+            for command in RulingRepair.model_validate(
+                record['response']
+            ).commands
+        ]
+        for command in reply.commands:
+            if command.id in repairs:
+                repair = RulingRepair.model_validate(
+                    repairs[command.id]['response']
                 )
-            already = {
-                self._command_key(command) for command in reply.commands
-            }
-            command_ids = {command.id for command in reply.commands}
-            for command in feedback.commands:
-                key = self._command_key(command)
-                if key in work.get('feedback_keys', []):
-                    continue
-                if (
-                    key in already
-                    or command.id in command_ids
-                    or command.origin_command_id in command_ids
-                ):
-                    continue
-                await self._apply_command(game, cards, command, work)
-                already.add(key)
-                command_ids.add(command.id)
-                work.setdefault('feedback_keys', []).append(key)
-                self._checkpoint(game, cards, work)
-            merged = reply.model_dump(mode='json')
-            for key in feedback.model_fields_set:
-                if key not in {'commands', 'checks'}:
-                    merged[key] = getattr(feedback, key)
-            reply = KeeperResponse.model_validate(merged)
+                completed.extend(repair.commands)
+            else:
+                completed.append(command)
+        reply.commands = completed
+        for record in repairs.values():
+            repair = RulingRepair.model_validate(record['response'])
+            reply.narration = repair.narration
+            reply.private_messages = repair.private_messages
+            reply.improvisation = repair.improvisation
+            reply.flags = repair.flags
+        if work['has_rolls']:
+            from aitrpg.application.feedback import finish_feedback
+
+            reply = await finish_feedback(
+                self, original, game, cards, reply, work
+            )
         group_scenes = game.scheduler.setdefault('group_scenes', {})
+        reply = await self._synchronise_controls(original, reply, work)
         group_scenes[game.group_id] = game.scene_id
         if reply.group_id:
             if reply.group_id not in {seat.group_id for seat in game.seats}:
@@ -1124,45 +1706,7 @@ class GameService:
             game.scene_id = reply.scene_id
         if not work.get('time_applied'):
             hours = reply.advance_days * 24 + reply.advance_hours
-            new_clock = game.hour + hours
-            elapsed_hours = math.floor(new_clock) - math.floor(game.hour)
-            elapsed_days = math.floor(new_clock / 24)
-            game.day += elapsed_days
-            game.hour = new_clock % 24
-            if elapsed_hours:
-                for character_id, card in cards.items():
-                    if 'dead' in card.conditions:
-                        continue
-                    card, rolls, details = apply_command(
-                        card,
-                        'recover',
-                        {'days': elapsed_days, 'hours': elapsed_hours},
-                        day=game.scheduler.get('base_day', 0) + game.day,
-                    )
-                    cards[character_id] = card
-                    for roll in rolls:
-                        work['events'].append(
-                            {
-                                'kind': 'check',
-                                'data': {
-                                    **roll.model_dump(mode='json'),
-                                    'character_id': character_id,
-                                },
-                                'is_private': False,
-                            }
-                        )
-                    work['events'].append(
-                        {
-                            'kind': 'ruling',
-                            'data': {
-                                'character_id': character_id,
-                                'command': 'natural_recovery',
-                                'reason': '游戏时间推进',
-                                'details': details,
-                            },
-                            'is_private': False,
-                        }
-                    )
+            self._advance_clock(game, cards, hours, work['events'])
             work['time_applied'] = True
             self._checkpoint(game, cards, work)
         game.flags.update(reply.flags)
@@ -1185,19 +1729,22 @@ class GameService:
         if game.mode == 'combat':
             game.combat['completed_command_ids'] = []
         game.node_count += 1
+        scene_nodes = game.scheduler.setdefault('scene_nodes', {})
+        scene_nodes[original.scene_id] = (
+            scene_nodes.get(original.scene_id, 0) + 1
+        )
         game.scheduler = record_selection(
             game,
             work['cycle'].get('eligible', []),
             work['cycle'].get('selected', []),
             work['cycle'].get('groups', []),
         )
-        recipients = self._group_actor_ids(game)
-        if reply.recipient_actor_ids:
-            if not set(reply.recipient_actor_ids).issubset(
-                {seat.actor_id for seat in game.seats}
-            ):
-                raise ValueError('秘密消息接收者不在游戏中')
-            recipients = reply.recipient_actor_ids
+        self._validate_narration(
+            original, reply, is_opening=work.get('is_opening', False)
+        )
+        recipients = self._narration_audience(
+            original, reply, is_opening=work.get('is_opening', False)
+        )
         scenario = self.scenario(game)
         if not set(reply.reveal_clue_ids).issubset(
             {clue.id for clue in scenario.clues}
@@ -1225,6 +1772,9 @@ class GameService:
             else ('running' if is_automatic else 'paused')
         )
         game.ending = reply.ending if reply.is_finished else ''
+        audience = work.get(
+            'audience_actor_ids', self._group_actor_ids(original)
+        )
         with self.store.transaction() as transaction:
             current = Game.model_validate(transaction.get('game', game.id))
             if current.revision != original.revision:
@@ -1269,27 +1819,33 @@ class GameService:
                         game.id,
                         'player',
                         submitted,
-                        actor_ids=work.get(
-                            'audience_actor_ids',
-                            self._group_actor_ids(original),
-                        ),
+                        actor_ids=audience,
+                        is_private=not audience,
                     )
             for event in work['events']:
                 transaction.append_event(
                     game.id,
                     event['kind'],
                     event['data'],
-                    actor_ids=work.get(
-                        'audience_actor_ids', self._group_actor_ids(original)
-                    ),
-                    is_private=event.get('is_private', False),
+                    actor_ids=audience,
+                    is_private=event.get('is_private', False) or not audience,
                 )
-            transaction.append_event(
+            narration_event = transaction.append_event(
                 game.id,
                 'narration',
                 {'text': reply.narration},
                 actor_ids=recipients,
+                is_private=not recipients,
             )
+            if reply.advance_days or reply.advance_hours:
+                game.scheduler['clock_anchor'] = narration_event['sequence']
+            for actor_id, message in reply.private_messages.items():
+                transaction.append_event(
+                    game.id,
+                    'narration',
+                    {'text': message},
+                    actor_ids=[actor_id],
+                )
             if reply.improvisation:
                 transaction.append_event(
                     game.id,
@@ -1312,6 +1868,304 @@ class GameService:
             transaction.delete('resolution_work', game.id)
             transaction.delete('cycle', game.id)
         return game
+
+    def _advance_clock(self, game, cards, hours, events):
+        new_clock = game.hour + hours
+        elapsed_hours = math.floor(new_clock) - math.floor(game.hour)
+        elapsed_days = math.floor(new_clock / 24)
+        game.day += elapsed_days
+        game.hour = new_clock % 24
+        if not elapsed_hours:
+            return
+        for character_id, card in cards.items():
+            if 'dead' in card.conditions:
+                continue
+            card, rolls, details = apply_command(
+                card,
+                'recover',
+                {'days': elapsed_days, 'hours': elapsed_hours},
+                day=game.scheduler.get('base_day', 0) + game.day,
+            )
+            cards[character_id] = card
+            for roll in rolls:
+                events.append(
+                    {
+                        'kind': 'check',
+                        'data': {
+                            **roll.model_dump(mode='json'),
+                            'character_id': character_id,
+                        },
+                        'is_private': False,
+                    }
+                )
+            events.append(
+                {
+                    'kind': 'ruling',
+                    'data': {
+                        'character_id': character_id,
+                        'command': 'natural_recovery',
+                        'reason': '游戏时间推进',
+                        'details': details,
+                    },
+                    'is_private': False,
+                }
+            )
+
+    async def synchronise_controls(self, identifier):
+        await self.pause(identifier)
+        async with self._locks.setdefault(identifier, asyncio.Lock()):
+            game = self.get(identifier)
+            if game.status == 'ended':
+                raise ValueError('结束后的游戏不能修正运行状态')
+            if self.store.get('resolution_work', identifier):
+                raise ValueError('尚有未完成裁定，请先处理当前错误')
+            records = self.store.events(identifier)
+            narratives = [
+                event for event in records if event['kind'] == 'narration'
+            ]
+            if not narratives:
+                raise ValueError('尚无已完成叙事可供核对')
+            work = self.store.get('control_work', identifier)
+            if not work or work.get('revision') != game.revision:
+                work = {
+                    'events': [],
+                    'force': True,
+                    'revision': game.revision,
+                }
+            reply = await self._synchronise_controls(
+                game,
+                KeeperResponse(narration=narratives[-1]['data']['text']),
+                work,
+            )
+            cards = {card.id: card for card in self._characters(game)}
+            self._advance_clock(
+                game,
+                cards,
+                reply.advance_days * 24 + reply.advance_hours,
+                work['events'],
+            )
+            if reply.scene_id:
+                game.scene_id = reply.scene_id
+                game.scheduler.setdefault('group_scenes', {})[
+                    game.group_id
+                ] = reply.scene_id
+            with self.store.transaction() as transaction:
+                current = transaction.get('game', identifier)
+                if current['revision'] != game.revision:
+                    raise ConflictError('核对期间游戏状态已变化')
+                game.token_usage = current['token_usage']
+                game.revision += 1
+                game.last_error = ''
+                game.scheduler['clock_anchor'] = narratives[-1]['sequence']
+                for card in cards.values():
+                    card.version += 1
+                    card.allocations.setdefault('runtime', {})[
+                        'lifetime_day'
+                    ] = game.scheduler.get('base_day', 0) + game.day
+                    transaction.put(
+                        'character', card.id, card.model_dump(mode='json')
+                    )
+                for event in work['events']:
+                    transaction.append_event(
+                        identifier,
+                        event['kind'],
+                        event['data'],
+                        actor_ids=self._group_actor_ids(game),
+                        is_private=event.get('is_private', False),
+                    )
+                transaction.append_event(
+                    identifier,
+                    'intervention',
+                    {'text': '主持核对已发生叙事的时间与场景'},
+                    is_private=True,
+                )
+                transaction.put(
+                    'game', identifier, game.model_dump(mode='json')
+                )
+                transaction.put(
+                    'snapshot',
+                    f'{identifier}@{game.revision}',
+                    {
+                        'game': game.model_dump(mode='json'),
+                        'characters': {
+                            key: card.model_dump(mode='json')
+                            for key, card in cards.items()
+                        },
+                    },
+                )
+                transaction.delete('control_work', identifier)
+                transaction.delete('cycle', identifier)
+            return game
+
+    async def _synchronise_controls(self, game, reply, work):
+        cues = (
+            r'第二天|次日|翌日|过夜|离岸|登岸|下船|抵达|到达|小时后|半小时后'
+        )
+        need_clock = work.get('force') or (
+            not (reply.advance_days or reply.advance_hours)
+            and re.search(cues, reply.narration)
+        )
+        need_scene = work.get('force') or (
+            not reply.scene_id
+            and any(
+                key.startswith(('at_', 'on_foot_', 'party_ashore')) and value
+                for key, value in reply.flags.items()
+            )
+        )
+        if not need_clock and not need_scene:
+            return reply
+        scenario = self.scenario(game)
+        old = [
+            event
+            for event in self.store.events(game.id)
+            if event['kind'] == 'narration'
+            and (
+                work.get('force')
+                or event['sequence'] > game.scheduler.get('clock_anchor', 0)
+            )
+        ][-10 if work.get('force') else -5 :]
+        narratives = [event['data'].get('text', '') for event in old] + [
+            reply.narration
+        ]
+        control_context = {
+            'current': {
+                'day': game.day,
+                'hour': game.hour,
+                'scene_id': game.scene_id,
+            },
+            'narratives': narratives,
+            'audit_instruction': (
+                '这是对已提交历史的补漏核对，current字段可能漏记过去的'
+                '跨日或误把路线讨论当成到达。以已发生叙事确定实际时空。'
+                '不能因字段声称某地点就忽略叙事只是在讨论未来去那里。'
+            )
+            if work.get('force')
+            else '',
+            'is_estimation_allowed': self.platform.settings.is_estimated_time,
+            'scene_catalog': [
+                {
+                    'id': scene.id,
+                    'title': scene.title,
+                    'description': (
+                        scene.public_text + '\n' + scene.keeper_text
+                    )[:1000],
+                    'next_scene_ids': scene.next_scene_ids,
+                    'conditions': scene.conditions,
+                }
+                for scene in scenario.scenes
+            ],
+        }
+        if 'control_projection' not in work:
+            projection = await self._invoke(
+                game,
+                game.keeper_actor_id,
+                'keeper_control',
+                KeeperControl,
+                extra=control_context,
+            )
+            work['control_projection'] = projection.model_dump(mode='json')
+            self.store.put(
+                'control_work' if work.get('force') else 'resolution_work',
+                game.id,
+                work,
+            )
+        projection = KeeperControl.model_validate(work['control_projection'])
+        changed = reply.model_copy(deep=True)
+        joined = '\n'.join(narratives)
+        invalid_quotes = [
+            key
+            for key, status in (
+                ('clock_quote', projection.clock_status),
+                ('scene_quote', projection.scene_status),
+            )
+            if status in {'supported', 'estimated'}
+            and (
+                not getattr(projection, key)
+                or getattr(projection, key) not in joined
+            )
+        ]
+        if invalid_quotes and not work.get('control_repaired'):
+            projection = await self._invoke(
+                game,
+                game.keeper_actor_id,
+                'keeper_control',
+                KeeperControl,
+                extra={
+                    **control_context,
+                    'reaction_key': 'quote_repair',
+                    'previous': projection.model_dump(mode='json'),
+                    'validation_error': (
+                        '引用必须是一段连续原文，禁止拼接或省略：'
+                        + ', '.join(invalid_quotes)
+                        + '。同时核对场景的剧情阶段与行进方向。'
+                    ),
+                },
+            )
+            work['control_projection'] = projection.model_dump(mode='json')
+            work['control_repaired'] = True
+            self.store.put(
+                'control_work' if work.get('force') else 'resolution_work',
+                game.id,
+                work,
+            )
+        if (
+            projection.clock_status in {'supported', 'estimated'}
+            and need_clock
+        ):
+            if (
+                not projection.clock_quote
+                or projection.clock_quote not in joined
+            ):
+                raise ValueError('时间投影缺少已发生叙事依据')
+            if (
+                projection.clock_status == 'estimated'
+                and not self.platform.settings.is_estimated_time
+            ):
+                raise ValueError('时间仅有近似依据，当前配置要求人工核对')
+            if projection.target_day is None or projection.target_hour is None:
+                raise ValueError('时间投影缺少绝对时刻')
+            delta = (
+                projection.target_day * 24
+                + projection.target_hour
+                - game.day * 24
+                - game.hour
+            )
+            if delta < 0:
+                raise ValueError('控制投影不能使游戏时间倒退')
+            changed.advance_hours = delta
+        elif projection.clock_status == 'needs_review' and need_clock:
+            raise ValueError('已发生叙事的时间需要核对：' + projection.reason)
+        if projection.scene_status == 'supported' and (
+            need_scene or need_clock
+        ):
+            if (
+                not projection.scene_quote
+                or projection.scene_quote not in joined
+            ):
+                raise ValueError('场景投影缺少已发生叙事依据')
+            self._validate_scene(game, projection.scene_id)
+            changed.scene_id = projection.scene_id
+        elif (
+            projection.scene_status == 'needs_review'
+            and (need_scene or need_clock)
+            and not reply.scene_id
+        ):
+            raise ValueError('场景控制需要核对：' + projection.reason)
+        if not work.get('projection_recorded'):
+            work['events'].append(
+                {
+                    'kind': 'control_projection',
+                    'data': projection.model_dump(mode='json'),
+                    'is_private': True,
+                }
+            )
+            work['projection_recorded'] = True
+            self.store.put(
+                'control_work' if work.get('force') else 'resolution_work',
+                game.id,
+                work,
+            )
+        return KeeperResponse.model_validate(changed.model_dump())
 
     def update_budget(self, identifier, budget_nodes, budget_tokens):
         game = self.get(identifier)
@@ -1453,7 +2307,11 @@ class GameService:
                     },
                     is_private=True,
                 )
-                for record in transaction.list('invitation'):
+                for record in transaction.list(
+                    'invitation',
+                    game_id=game.id,
+                    statuses=['pending', 'claimed'],
+                ):
                     if record['game_id'] == game.id and record['status'] in {
                         'pending',
                         'claimed',
@@ -1462,6 +2320,7 @@ class GameService:
                         transaction.put('invitation', record['id'], record)
                 transaction.delete('cycle', game.id)
                 transaction.delete('resolution_work', game.id)
+                transaction.delete('control_work', game.id)
             return game
 
     async def finish(self, identifier, ending='用户结束本局'):
@@ -1520,7 +2379,12 @@ class GameService:
             max(wait_seconds, 0), 20
         )
         while True:
-            for record in self.store.list('invitation'):
+            for record in self.store.list(
+                'invitation',
+                game_id=identity['game_id'],
+                actor_id=identity['actor_id'],
+                statuses=['pending', 'claimed'],
+            ):
                 if (
                     record['actor_id'] == identity['actor_id']
                     and record['game_id'] == identity['game_id']

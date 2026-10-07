@@ -3,10 +3,17 @@ from pathlib import Path
 
 import pytest
 from PIL import Image
+from test_games import FixedDice
+from test_games import ScriptedClient
+from test_games import setup_platform
 
+from aitrpg.adapters.mcp_server import AgentGateway
 from aitrpg.adapters.storage import Store
 from aitrpg.application.scenarios import ScenarioDraft
 from aitrpg.application.scenarios import ScenarioService
+from aitrpg.domain.models import KeeperControl
+from aitrpg.domain.models import KeeperResponse
+from aitrpg.domain.models import PlayerResponse
 from aitrpg.domain.models import Scenario
 from aitrpg.domain.models import ScenarioAsset
 from aitrpg.domain.models import ScenarioContent
@@ -15,6 +22,7 @@ from aitrpg.domain.models import ScenarioScene
 from aitrpg.domain.models import SourceBlock
 from aitrpg.domain.privacy import retrieve_sources
 from aitrpg.domain.privacy import scenario_for_viewer
+from aitrpg.domain.rules import skill_check
 
 
 def test_merging_public_npc_does_not_publish_later_private_revelation():
@@ -150,6 +158,150 @@ def test_solo_scene_read_aloud_stays_with_its_participant():
     )
     assert '师兄房中发现私信' in own
     assert '师兄房中发现私信' not in other
+
+
+def test_entering_other_solo_keeps_already_revealed_evidence():
+    scenario = Scenario(
+        title='已知资料',
+        scenes=[
+            ScenarioScene(id='hall', title='门厅'),
+            ScenarioScene(
+                id='solo',
+                title='HO1间章',
+                public_text='师兄房中的私信',
+                conditions={'participants': ['ho1']},
+            ),
+        ],
+        clues=[
+            ScenarioContent(
+                id='read_note',
+                title='已读便笺',
+                text='门厅的失物线索',
+                scene_ids=['hall'],
+            ),
+            ScenarioContent(
+                id='unread_note',
+                title='未读便笺',
+                text='尚未发现的地道',
+                scene_ids=['hall'],
+            ),
+        ],
+        assets=[
+            ScenarioAsset(
+                id='hall_map',
+                name='已经取得的门厅图',
+                path='assets/hall.png',
+                mime_type='image/png',
+                scene_ids=['hall'],
+            ),
+        ],
+    )
+    other = json.dumps(
+        scenario_for_viewer(
+            scenario,
+            role_id='ho2',
+            scene_id='solo',
+            revealed_ids=['read_note', 'hall_map'],
+        ),
+        ensure_ascii=False,
+    )
+    assert '门厅的失物线索' in other
+    assert '已经取得的门厅图' in other
+    assert '尚未发现的地道' not in other
+    assert '师兄房中的私信' not in other
+    assert 'assets/hall.png' not in other
+
+
+async def test_failed_sighting_does_not_read_script_through_game_or_mcp(
+    tmp_path: Path,
+):
+    truth = '黑鸟的眉眼似人'
+    unused_summary = '剧情摘要中尚未发生的结局'
+
+    def transform(platform, scenario):
+        scene = scenario.scenes[0]
+        scenario.description = unused_summary
+        scene.public_text = f'预编写场景朗读：{truth}。'
+        scene.keeper_text = f'目击成功后才能说明：{truth}。'
+        scenario.clues.append(
+            ScenarioContent(
+                id='sighting',
+                title='目击细节',
+                text=truth,
+                scene_ids=[scene.id],
+                source_ids=scene.source_ids,
+            )
+        )
+        platform.scenarios.save(scenario)
+        return platform.scenarios.approve(scenario.id)
+
+    def handler(call):
+        if call['task'] == 'player':
+            return PlayerResponse(speech='你看清了吗？', intent='询问目击者')
+        if call['task'] == 'keeper_control':
+            return KeeperControl(
+                clock_status='unchanged',
+                scene_status='unchanged',
+            )
+        return KeeperResponse(
+            narration=f'目击的同伴解释了刚才所见：{truth}。',
+            reveal_clue_ids=['sighting'],
+        )
+
+    platform, game, cards, _ = setup_platform(
+        tmp_path,
+        ScriptedClient(handler),
+        grouped=False,
+        scenario_transform=transform,
+    )
+    try:
+        failed = skill_check(cards[0], '侦查', rng=FixedDice([9, 9]))
+        assert not failed.details['is_success']
+        game.node_count = game.revision = 1
+        game.last_keeper = {'narration': '只看见黑鸟的背面。'}
+        with platform.store.transaction() as transaction:
+            transaction.put('game', game.id, game.model_dump(mode='json'))
+            transaction.append_event(
+                game.id,
+                'check',
+                {
+                    **failed.model_dump(mode='json'),
+                    'character_id': cards[0].id,
+                    'scene_id': game.scene_id,
+                },
+            )
+            transaction.append_event(
+                game.id,
+                'narration',
+                {'text': '只看见黑鸟的背面。'},
+            )
+        actor_id = cards[0].actor_id
+        token = platform.issue_agent_token(game.id, actor_id)
+        gateway = AgentGateway(platform)
+        views = [
+            platform.games.view(game.id, actor_id),
+            platform.games.context(game, actor_id, 'player'),
+            await gateway.dispatch('get_my_state', {'token': token}),
+        ]
+        for view in views:
+            text = json.dumps(view, ensure_ascii=False)
+            assert truth not in text
+            assert unused_summary not in text
+            assert '只看见黑鸟的背面' in text
+        finished = await platform.step_game(game.id)
+        assert not finished.last_error
+        views = [
+            platform.games.view(game.id, actor_id),
+            platform.games.context(finished, actor_id, 'player'),
+            await gateway.dispatch('get_my_state', {'token': token}),
+        ]
+        for view in views:
+            text = json.dumps(view, ensure_ascii=False)
+            assert truth in text
+            assert '目击的同伴解释了刚才所见' in text
+            assert unused_summary not in text
+    finally:
+        platform.store.close()
 
 
 def test_map_fog_hides_pixels_and_role_reveal_isolated(tmp_path: Path):

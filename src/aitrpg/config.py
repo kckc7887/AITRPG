@@ -15,6 +15,7 @@ class Settings(BaseSettings):
     port: int = 8080
     invitation_seconds: int = 120
     is_browser_open: bool = True
+    is_estimated_time: bool = True
 
 
 def environment_value(name: str) -> str:

@@ -31,6 +31,16 @@ MAX_ARCHIVE_DEPTH = 4
 MAX_TEXT_CHARS = 800000
 MAX_IMAGE_PIXELS = 40000000
 IMAGE_SUFFIXES = {'.png', '.jpg', '.jpeg', '.webp', '.gif', '.bmp'}
+DEVICE_NAMES = {
+    'con',
+    'prn',
+    'aux',
+    'nul',
+    'conin$',
+    'conout$',
+    *(f'com{number}' for number in '123456789¹²³'),
+    *(f'lpt{number}' for number in '123456789¹²³'),
+}
 
 
 class AttachmentError(ValueError):
@@ -66,6 +76,12 @@ def safe_member_path(directory: Path, name: str) -> Path:
         relative.is_absolute()
         or not relative.parts
         or any(part in {'.', '..'} or ':' in part for part in relative.parts)
+        or any(
+            part.endswith(('.', ' '))
+            or part.split('.', 1)[0].rstrip(' ').lower() in DEVICE_NAMES
+            or any(char in '<>"|?*' for char in part)
+            for part in relative.parts
+        )
         or any(ord(char) < 32 for char in normalized)
     ):
         raise AttachmentError('附件包含不安全的路径')

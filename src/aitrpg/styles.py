@@ -13,6 +13,8 @@ body, .q-field, .q-btn {
 }
 .q-header { background: var(--ink); color: var(--paper); }
 .q-header .q-btn, .q-header a { color: var(--paper) !important; }
+.q-header .q-btn { background: transparent !important; }
+.q-header .nav-selected { background: #ffffff1a !important; }
 .q-page-container { padding-top: 68px !important; }
 .q-page { min-height: calc(100vh - 68px) !important; }
 .q-card { box-shadow: none; border: 1px solid var(--line); }
@@ -48,6 +50,7 @@ a { color: #456d88; text-underline-offset: 3px; }
   gap: 20px; align-items: start; width: 100%;
 }
 .reader-sidebar { position: sticky; top: 92px; }
+.reader-grid > * { min-width: 0; }
 .reader-paper { padding: 36px 40px; min-height: 55vh; }
 .story-event {
   padding: 0 0 24px 20px; margin: 0 0 24px;
@@ -57,6 +60,7 @@ a { color: #456d88; text-underline-offset: 3px; }
 .story-event .story-text {
   font-family: 'Noto Serif CJK SC', 'Source Han Serif SC', 'SimSun', serif;
   font-size: 17px; line-height: 1.9; letter-spacing: .015em;
+  overflow-wrap: anywhere;
 }
 .event-meta { font-size: 12px; color: var(--muted); margin-bottom: 8px; }
 .event-detail { font-size: 13px; color: var(--muted); }

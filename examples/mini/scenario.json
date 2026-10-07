@@ -1,0 +1,124 @@
+{
+  "id": "mini-last-lamp",
+  "version": 1,
+  "created_at": "2026-10-07T21:20:46.088743Z",
+  "title": "最后一盏灯",
+  "description": "一个安全的单场景：读纸条确认姓名，按绿色按钮发安全信号。",
+  "era": "不限年代（可使用1920年代角色）",
+  "ruleset": "coc7",
+  "min_players": 1,
+  "max_players": 2,
+  "status": "approved",
+  "author": "AITRPG",
+  "rights": "项目自写演示内容，允许使用、修改和随项目分发。",
+  "source": "builtin:mini-last-lamp",
+  "scenes": [
+    {
+      "id": "signal_room",
+      "title": "安全信号室",
+      "public_text": "你们站在一间安全的信号室，桌上只有一张纸条、一个绿色确认按钮、一盏尚未亮起的信号灯和出纸槽。你们共同负责发出安全信号。纸条的大字清楚写着：请确认自己的姓名，然后按绿色按钮；信号灯变绿便表示安全信号已经送达，任务立即完成。室内没有其他人，没有敌人、危险、暗门或谜团。",
+      "keeper_text": "你们站在一间安全的信号室，桌上只有一张纸条、一个绿色确认按钮、一盏尚未亮起的信号灯和出纸槽。你们共同负责发出安全信号。纸条的大字清楚写着：请确认自己的姓名，然后按绿色按钮；信号灯变绿便表示安全信号已经送达，任务立即完成。室内没有其他人，没有敌人、危险、暗门或谜团。\n\n纸条小字可以自愿进行最多一次普通侦查检定。成功时读到附加细节：按钮左侧出纸槽会打印一张署有按按钮者姓名的安全信号确认收据。失败时只没看清这行小字，不耽误确认姓名或按按钮。纸条的大字和按钮用途不需要检定，不得反复检定或设置密码。\n\n任一参加角色通过自己的真实发言或意图确认姓名并按下按钮后，主持描述信号灯立即变绿，将顶层flags.signal_sent设为true，不用电路、语言、身份、力量、权限或其他检定。立刻按既有源条件结束，不再要求第二人重复按按钮。\n\n信号发出后，主持对实际按按钮角色的character_id申请add_item，parameters.item为{name:安全信号确认收据,description:署有本人姓名，证明安全信号已经送达}。每个参加角色的character_id分别申请gain_sanity，parameters.amount为字符串1D2；平台分别投真实奖励骰，主持不得口述随机结果，也不请求SAN损失或重复奖励。设置is_finished=true，ending写明结局安全信号及signal_sent；由平台正常结束流程记录每名角色的经历并解除本局占用。有骰时根据actual_rule_results回填结果后结束，已执行命令不重复。",
+      "source_ids": [
+        "mini-opening",
+        "mini-investigation",
+        "mini-completion",
+        "mini-rewards"
+      ],
+      "next_scene_ids": [],
+      "conditions": {
+        "completion_flag": "signal_sent",
+        "ending_ids": [
+          "safe_signal"
+        ],
+        "max_optional_spot_hidden_checks": 1,
+        "requires_no_other_scene": true
+      }
+    }
+  ],
+  "roles": [],
+  "npcs": [],
+  "clues": [
+    {
+      "id": "receipt_detail",
+      "title": "纸条的小字",
+      "text": "按钮左侧的出纸槽会打印一张署有按按钮者姓名的安全信号确认收据。",
+      "visibility": "keeper",
+      "role_ids": [],
+      "scene_ids": [
+        "signal_room"
+      ],
+      "source_ids": [
+        "mini-investigation"
+      ]
+    }
+  ],
+  "handouts": [
+    {
+      "id": "public_note",
+      "title": "桌上的纸条",
+      "text": "请确认自己的姓名，然后按绿色按钮。信号灯变绿表示安全信号已送达。",
+      "visibility": "public",
+      "role_ids": [],
+      "scene_ids": [
+        "signal_room"
+      ],
+      "source_ids": [
+        "mini-opening"
+      ]
+    }
+  ],
+  "endings": [
+    {
+      "id": "safe_signal",
+      "title": "结局：安全信号",
+      "text": "安全信号已经送达，灯变绿。确认收据打印完毕，所有参加角色安心完成任务。",
+      "visibility": "keeper",
+      "role_ids": [],
+      "scene_ids": [
+        "signal_room"
+      ],
+      "source_ids": [
+        "mini-completion",
+        "mini-rewards"
+      ]
+    }
+  ],
+  "assets": [],
+  "source_blocks": [
+    {
+      "id": "mini-opening",
+      "file": "scenario.json",
+      "locator": "/source_blocks/0/text",
+      "text": "你们站在一间安全的信号室，桌上只有一张纸条、一个绿色确认按钮、一盏尚未亮起的信号灯和出纸槽。你们共同负责发出安全信号。纸条的大字清楚写着：请确认自己的姓名，然后按绿色按钮；信号灯变绿便表示安全信号已经送达，任务立即完成。室内没有其他人，没有敌人、危险、暗门或谜团。",
+      "kind": "text"
+    },
+    {
+      "id": "mini-investigation",
+      "file": "scenario.json",
+      "locator": "/source_blocks/1/text",
+      "text": "纸条小字可以自愿进行最多一次普通侦查检定。成功时读到附加细节：按钮左侧出纸槽会打印一张署有按按钮者姓名的安全信号确认收据。失败时只没看清这行小字，不耽误确认姓名或按按钮。纸条的大字和按钮用途不需要检定，不得反复检定或设置密码。",
+      "kind": "text"
+    },
+    {
+      "id": "mini-completion",
+      "file": "scenario.json",
+      "locator": "/source_blocks/2/text",
+      "text": "任一参加角色通过自己的真实发言或意图确认姓名并按下按钮后，主持描述信号灯立即变绿，将顶层flags.signal_sent设为true，不用电路、语言、身份、力量、权限或其他检定。立刻按既有源条件结束，不再要求第二人重复按按钮。",
+      "kind": "text"
+    },
+    {
+      "id": "mini-rewards",
+      "file": "scenario.json",
+      "locator": "/source_blocks/3/text",
+      "text": "信号发出后，主持对实际按按钮角色的character_id申请add_item，parameters.item为{name:安全信号确认收据,description:署有本人姓名，证明安全信号已经送达}。每个参加角色的character_id分别申请gain_sanity，parameters.amount为字符串1D2；平台分别投真实奖励骰，主持不得口述随机结果，也不请求SAN损失或重复奖励。设置is_finished=true，ending写明结局安全信号及signal_sent；由平台正常结束流程记录每名角色的经历并解除本局占用。有骰时根据actual_rule_results回填结果后结束，已执行命令不重复。",
+      "kind": "text"
+    }
+  ],
+  "review_issues": [],
+  "custom_rules": [
+    "源边界：只有一张纸条、绿色按钮、信号灯和出纸槽；没有敌人、NPC、额外谜团、门禁或支线。不得新增核心任务或拖延完成。",
+    "按钮可随时按，普通侦查只补充收据细节，失败不阻主任务。",
+    "安全信号完成奖励为每名参加角色一次gain_sanity(amount=\"1D2\")；仅按按钮角色取得一张收据。"
+  ],
+  "directory": ""
+}

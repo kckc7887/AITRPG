@@ -10,12 +10,14 @@ from alembic import command
 from alembic.config import Config
 from sqlalchemy import JSON
 from sqlalchemy import Boolean
+from sqlalchemy import Index
 from sqlalchemy import Integer
 from sqlalchemy import String
 from sqlalchemy import UniqueConstraint
 from sqlalchemy import create_engine
 from sqlalchemy import func
 from sqlalchemy import inspect
+from sqlalchemy import literal_column
 from sqlalchemy import select
 from sqlalchemy.orm import DeclarativeBase
 from sqlalchemy.orm import Mapped
@@ -35,6 +37,15 @@ class DocumentRow(Base):
     kind: Mapped[str] = mapped_column(String, primary_key=True)
     id: Mapped[str] = mapped_column(String, primary_key=True)
     body: Mapped[dict[str, Any]] = mapped_column(JSON)
+    __table_args__ = (
+        Index(
+            'ix_documents_game_status',
+            'kind',
+            func.json_extract(body, literal_column("'$.game_id'")),
+            func.json_extract(body, literal_column("'$.status'")),
+            func.json_extract(body, literal_column("'$.actor_id'")),
+        ),
+    )
 
 
 class EventRow(Base):
@@ -70,10 +81,25 @@ class Transaction:
         row = self.session.get(DocumentRow, (kind, identifier))
         return deepcopy(row.body) if row else None
 
-    def list(self, kind: str) -> list[dict[str, Any]]:
-        rows = self.session.scalars(
-            select(DocumentRow).where(DocumentRow.kind == kind)
-        )
+    def list(
+        self, kind: str, *, game_id=None, statuses=None, actor_id=None
+    ) -> list[dict[str, Any]]:
+        query = select(DocumentRow).where(DocumentRow.kind == kind)
+        for key, value in (('game_id', game_id), ('actor_id', actor_id)):
+            if value is not None:
+                query = query.where(
+                    func.json_extract(
+                        DocumentRow.body, literal_column(f"'$.{key}'")
+                    )
+                    == value
+                )
+        if statuses is not None:
+            query = query.where(
+                func.json_extract(
+                    DocumentRow.body, literal_column("'$.status'")
+                ).in_(statuses)
+            )
+        rows = self.session.scalars(query)
         return [deepcopy(row.body) for row in rows]
 
     def put(
@@ -203,9 +229,9 @@ class Store:
         with self.transaction() as transaction:
             return transaction.get(kind, identifier)
 
-    def list(self, kind: str) -> list[dict[str, Any]]:
+    def list(self, kind: str, **filters) -> list[dict[str, Any]]:
         with self.transaction() as transaction:
-            return transaction.list(kind)
+            return transaction.list(kind, **filters)
 
     def put(self, kind: str, identifier: str, body: dict[str, Any]) -> None:
         with self.transaction() as transaction:

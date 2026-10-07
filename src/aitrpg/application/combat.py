@@ -1,3 +1,4 @@
+import re
 from copy import deepcopy
 from typing import Any
 
@@ -33,6 +34,33 @@ NPC_REQUIRED = {
     'damage',
     'armor',
 }
+STUN_SOURCE = 'https://cthulhuwiki.chaosium.com/equipment/weapons.html'
+KNIFE_NAMES = {'格斗刀', '小刀', '匕首', '中型刀', '大型刀', 'knife'}
+CONTACT_TASERS = {'电击器', '接触电击器', 'taser (contact)', 'contact taser'}
+
+
+class ValidatorDice:
+    def randint(self, minimum, maximum):
+        return minimum
+
+
+def _damage_spec(expression: str) -> tuple[str, list[str]]:
+    if not isinstance(expression, str):
+        raise ValueError('武器伤害必须为安全骰式文字')
+    match = re.fullmatch(r'\s*(.+?)\s*\+\s*(stun|眩晕)\s*', expression, re.I)
+    if match:
+        return match[1].strip(), ['stun']
+    return expression, []
+
+
+def _validate_profile(profile: dict) -> dict:
+    expression, effects = _damage_spec(profile['damage'])
+    profile['damage'] = expression
+    profile['effects'] = effects
+    if effects and not re.search(r'\bDB\b', expression, re.I):
+        profile['damage_bonus'] = '0'
+    weapon_damage(expression, profile['damage_bonus'], rng=ValidatorDice())
+    return profile
 
 
 def _integer(value: Any, name: str, minimum: int = 0) -> int:
@@ -196,12 +224,7 @@ def _start_combat(service, game, cards, command, work) -> None:
         if not isinstance(npc['damage'], str):
             raise ValueError('NPC伤害必须为骰式')
 
-        # 验证骰式，不产生需要回填的游戏骰点。
-        class ValidatorDice:
-            def randint(self, minimum, maximum):
-                return minimum
-
-        roll_dice(npc['damage'], rng=ValidatorDice())
+        _profile(npc, None, {'mode': 'melee'})
         npc.update(
             {
                 'max_hp': npc['hp'],
@@ -249,7 +272,7 @@ def _start_combat(service, game, cards, command, work) -> None:
     )
 
 
-def _split_groups(game: Game, command: RuleCommand, work: dict) -> None:
+def _split_groups(service, game, command: RuleCommand, work: dict) -> None:
     if game.mode == 'combat':
         raise ValueError('战斗中不能直接分队，请先结束战斗')
     groups = command.parameters.get('groups')
@@ -272,18 +295,34 @@ def _split_groups(game: Game, command: RuleCommand, work: dict) -> None:
             assignments[actor_id] = group_id
     if set(assignments) != known:
         raise ValueError('分队必须为每个调查员安排一支队伍')
+    requested_scenes = command.parameters.get('group_scenes', {})
+    if not isinstance(requested_scenes, dict) or not set(
+        requested_scenes
+    ).issubset(groups):
+        raise ValueError('分队场景必须属于本次分队')
+    for scene_id in requested_scenes.values():
+        service._validate_scene(game, scene_id)
+    previous_scenes = game.scheduler.get('group_scenes', {})
+    game.scheduler['group_scenes'] = {
+        group_id: requested_scenes.get(
+            group_id, previous_scenes.get(group_id, game.scene_id)
+        )
+        for group_id in groups
+    }
     game.seats = [
         seat.model_copy(update={'group_id': assignments[seat.actor_id]})
         for seat in game.seats
     ]
     if game.group_id not in groups:
         game.group_id = next(iter(groups))
+    game.scene_id = game.scheduler['group_scenes'][game.group_id]
     _event(
         work,
         'ruling',
         {
             'command': 'split_groups',
             'groups': groups,
+            'group_scenes': game.scheduler['group_scenes'],
             'reason': command.reason,
         },
         command.is_private,
@@ -298,15 +337,17 @@ def _profile(entry: dict, card: Character | None, parameters: dict) -> dict:
         key = 'firearms' if is_firearm else 'fighting'
         if key not in entry:
             raise ValueError(f'NPC缺少攻击技能：{key}')
-        return {
-            'skill': key,
-            'target': entry[key],
-            'damage': entry['damage'],
-            'damage_bonus': entry.get('damage_bonus', '0'),
-            'is_firearm': is_firearm,
-            'is_impaling': bool(entry.get('is_impaling', is_firearm)),
-            'name': entry.get('weapon_name', 'NPC攻击'),
-        }
+        return _validate_profile(
+            {
+                'skill': key,
+                'target': entry[key],
+                'damage': entry['damage'],
+                'damage_bonus': entry.get('damage_bonus', '0'),
+                'is_firearm': is_firearm,
+                'is_impaling': bool(entry.get('is_impaling', is_firearm)),
+                'name': entry.get('weapon_name', 'NPC攻击'),
+            }
+        )
     index = parameters.get('weapon_index')
     if index is None:
         weapon = {'name': '徒手', 'skill': '格斗：斗殴', 'damage': '1D3'}
@@ -315,13 +356,32 @@ def _profile(entry: dict, card: Character | None, parameters: dict) -> dict:
         if index >= len(card.weapons):
             raise ValueError('角色卡没有该武器')
         weapon = card.weapons[index]
-        if not weapon.get('skill') or not weapon.get('damage'):
-            raise ValueError('角色卡武器缺少技能或伤害资料')
-    skill = normalize_skill(weapon['skill'])
+        if not weapon.get('damage'):
+            raise ValueError('角色卡武器缺少伤害资料')
+    official_skill = (
+        '格斗：斗殴' if weapon.get('name', '').lower() in KNIFE_NAMES else None
+    )
+    contact_taser = (
+        weapon.get('name', '').lower() in CONTACT_TASERS
+        and (
+            '接触' in str(weapon.get('notes', ''))
+            or 'contact' in str(weapon.get('notes', '')).lower()
+        )
+        and _damage_spec(weapon['damage'])[1] == ['stun']
+    )
+    contact_skill = '格斗：斗殴' if contact_taser else None
+    declared_skill = weapon.get('skill') or official_skill or contact_skill
+    skill_name = declared_skill or parameters.get('skill')
+    if not skill_name:
+        raise ValueError(
+            '角色卡武器未记录技能，主持须以skill指定卡上真实技能并说明依据'
+        )
+    skill = normalize_skill(skill_name)
     if skill not in card.skills:
         raise ValueError('角色卡没有武器使用技能')
     if (
-        parameters.get('skill')
+        declared_skill
+        and parameters.get('skill')
         and normalize_skill(parameters['skill']) != skill
     ):
         raise ValueError('不能用主持指定技能替换武器的真实技能')
@@ -330,15 +390,62 @@ def _profile(entry: dict, card: Character | None, parameters: dict) -> dict:
         'firearm' if is_firearm else 'melee'
     ):
         raise ValueError('攻击模式与角色卡武器不一致')
-    return {
-        'skill': skill,
-        'target': card.skills[skill],
-        'damage': weapon['damage'],
-        'damage_bonus': '0' if is_firearm else card.damage_bonus,
-        'is_firearm': is_firearm,
-        'is_impaling': bool(weapon.get('is_impaling', is_firearm)),
-        'name': weapon.get('name', skill),
-    }
+    return _validate_profile(
+        {
+            'skill': skill,
+            'target': card.skills[skill],
+            'damage': weapon['damage'],
+            'damage_bonus': '0' if is_firearm else card.damage_bonus,
+            'is_firearm': is_firearm,
+            'is_impaling': bool(
+                weapon.get('is_impaling', is_firearm or bool(official_skill))
+            ),
+            'name': weapon.get('name', skill),
+            'skill_ruling': not bool(declared_skill),
+            'skill_source': (
+                '角色卡武器'
+                if weapon.get('skill')
+                else (
+                    '官方刀具使用技能'
+                    if official_skill
+                    else (
+                        '接触式电击使用卡上斗殴，适用性待主持确认'
+                        if contact_skill
+                        else '主持指明角色卡真实技能'
+                    )
+                )
+            ),
+        }
+    )
+
+
+def _weapon_effects(profile, target, damage, work, private, rng):
+    for effect in profile.get('effects', []):
+        duration = roll_dice('1D6', rng=rng, reason='若眩晕生效的持续轮数')
+        duration.details['is_conditional'] = True
+        _roll_event(work, duration, target['id'], private)
+        _event(
+            work,
+            'ruling',
+            {
+                'command': 'weapon_effect',
+                'character_id': target['id'],
+                'details': {
+                    'effect': effect,
+                    'weapon': profile['name'],
+                    'damage': damage,
+                    'duration_rounds_if_applied': duration.total,
+                    'duration_roll_id': duration.id,
+                    'source': STUN_SOURCE,
+                    'status': 'pending_keeper_ruling',
+                    'needs_keeper_ruling': (
+                        '数值伤害已结算；眩晕是否适用该目标由主持裁定，'
+                        '生效时采用已骰轮数，不重新投骰'
+                    ),
+                },
+            },
+            private,
+        )
 
 
 def _check(
@@ -691,6 +798,14 @@ async def _attack(service, game, cards, command, work) -> None:
                 command.is_private,
                 rng,
             )
+            _weapon_effects(
+                damage_profile,
+                damaged,
+                damage_roll.total,
+                work,
+                command.is_private,
+                rng,
+            )
         _event(
             work,
             'ruling',
@@ -701,6 +816,14 @@ async def _attack(service, game, cards, command, work) -> None:
                 'target_id': target_id,
                 'defense': defense,
                 'winner': winner,
+                'weapon': profile['name'],
+                'skill': profile['skill'],
+                'skill_value': profile['target'],
+                'skill_source': (
+                    '主持指明使用角色卡真实技能'
+                    if profile.get('skill_ruling')
+                    else profile.get('skill_source', 'NPC来源资料')
+                ),
             },
             command.is_private,
         )
@@ -733,7 +856,7 @@ async def apply_game_command(
             command.is_private,
         )
     elif command.kind == 'split_groups':
-        _split_groups(game, command, work)
+        _split_groups(service, game, command, work)
     elif command.kind == 'combat_attack':
         await _attack(service, game, cards, command, work)
     else:
