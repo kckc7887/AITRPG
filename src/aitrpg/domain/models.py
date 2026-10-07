@@ -234,8 +234,11 @@ class Invitation(Entity):
     character_id: str | None = None
     revision: int
     purpose: Literal[
-        'player', 'keeper_opening', 'keeper_resolution', 'keeper_feedback',
-        'reaction'
+        'player',
+        'keeper_opening',
+        'keeper_resolution',
+        'keeper_feedback',
+        'reaction',
     ]
     scene_id: str
     status: Literal[

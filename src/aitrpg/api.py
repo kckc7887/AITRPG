@@ -1,9 +1,23 @@
 from fastapi import FastAPI
 from fastapi import HTTPException
+from pydantic import Field
 
 from aitrpg.application.platform import Platform
 from aitrpg.domain.models import Actor
+from aitrpg.domain.models import Character
+from aitrpg.domain.models import Model
 from aitrpg.domain.models import Provider
+
+
+class CharacterGeneration(Model):
+    actor_id: str
+    concept: str = Field(min_length=1, max_length=12000)
+    public_scenario: str = Field(default='', max_length=12000)
+
+
+class CharacterImport(Model):
+    actor_id: str
+    path: str
 
 
 def register_api(app: FastAPI, platform: Platform):
@@ -43,3 +57,21 @@ def register_api(app: FastAPI, platform: Platform):
         if record is None:
             raise HTTPException(404, 'AI 身份不存在')
         return record
+
+    @app.get('/api/v1/characters')
+    def characters(actor_id: str | None = None):
+        return platform.characters.list(actor_id)
+
+    @app.post('/api/v1/characters')
+    def save_character(character: Character):
+        return platform.characters.save(character)
+
+    @app.post('/api/v1/characters/generate')
+    async def generate_character(request: CharacterGeneration):
+        return await platform.characters.generate(
+            request.actor_id, request.concept, request.public_scenario
+        )
+
+    @app.post('/api/v1/characters/import')
+    def import_character(request: CharacterImport):
+        return platform.characters.import_xlsx(request.path, request.actor_id)
