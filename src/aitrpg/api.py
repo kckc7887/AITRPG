@@ -53,6 +53,18 @@ class MapChange(Model):
     revealed_regions: dict[str, list[str]] = Field(default_factory=dict)
 
 
+class MapAnnotationChange(Model):
+    nodes: list[dict]
+    regions: list[dict]
+    name: str | None = None
+    caption: str | None = None
+    is_map: bool | None = None
+    visibility: str | None = None
+    role_ids: list[str] | None = None
+    scene_ids: list[str] | None = None
+    is_fog_enabled: bool | None = None
+
+
 def register_api(app: FastAPI, platform: Platform):
     @app.exception_handler(ValueError)
     async def value_error_handler(request, error):
@@ -131,6 +143,27 @@ def register_api(app: FastAPI, platform: Platform):
     def approve_scenario(scenario_id: str):
         return platform.scenarios.approve(scenario_id)
 
+    @app.post('/api/v1/scenarios/{scenario_id}/assets/{asset_id}/annotations')
+    def update_map_annotations(
+        scenario_id: str, asset_id: str, request: MapAnnotationChange
+    ):
+        return platform.scenarios.update_map_annotations(
+            scenario_id, asset_id, **request.model_dump()
+        )
+
+    @app.get('/api/v1/scenarios/{scenario_id}/assets/{asset_id}')
+    def preview_scenario_asset(scenario_id: str, asset_id: str):
+        scenario = platform.scenarios.get(scenario_id)
+        try:
+            path = platform.scenarios.asset_for_viewer(
+                scenario, asset_id, is_keeper=True
+            )
+        except (PermissionError, FileNotFoundError) as error:
+            raise HTTPException(
+                status_code=404, detail='素材不存在'
+            ) from error
+        return FileResponse(path, headers={'Cache-Control': 'no-store'})
+
     @app.get('/api/v1/games')
     def games():
         return platform.list_games()
@@ -178,8 +211,15 @@ def register_api(app: FastAPI, platform: Platform):
         )
 
     @app.get('/api/v1/games/{game_id}/assets/{asset_id}')
-    def asset(game_id: str, asset_id: str, actor_id: str | None = None):
-        path = platform.games.asset_path(game_id, asset_id, actor_id)
+    def asset(
+        game_id: str,
+        asset_id: str,
+        actor_id: str | None = None,
+        markers: bool = True,
+    ):
+        path = platform.games.asset_path(
+            game_id, asset_id, actor_id, include_markers=markers
+        )
         return FileResponse(
             path, headers={'Cache-Control': 'private, no-store'}
         )

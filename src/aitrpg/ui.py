@@ -12,6 +12,7 @@ from uuid import uuid4
 
 import keyring
 from nicegui import ui
+from nicegui.elements.dialog import Dialog
 
 from aitrpg.config import environment_value
 from aitrpg.domain.models import Actor
@@ -21,6 +22,9 @@ from aitrpg.domain.models import Provider
 from aitrpg.domain.models import Scenario
 from aitrpg.domain.models import Seat
 from aitrpg.styles import APP_CSS
+from aitrpg.ui_maps import open_game_map_editor
+from aitrpg.ui_maps import open_scenario_map_editor
+from aitrpg.ui_maps import render_map
 
 NAVIGATION = (
     ('概览', '/', 'space_dashboard'),
@@ -542,12 +546,12 @@ def _character_dialog(
                     sex = ui.input('性别', value=character.sex)
                 ui.label('属性').classes('record-title mt-4')
                 attribute_inputs = {}
-                with ui.grid(columns=4).classes('w-full'):
+                with ui.grid().classes('attribute-grid w-full'):
                     for key, value in character.attributes.items():
                         attribute_inputs[key] = ui.number(
                             key, value=value, min=1, precision=0
                         )
-                with ui.grid(columns=4).classes('w-full mt-4'):
+                with ui.grid().classes('attribute-grid w-full mt-4'):
                     hp = ui.number('当前 HP', value=character.current_hp)
                     mp = ui.number('当前 MP', value=character.current_mp)
                     san = ui.number('当前 SAN', value=character.current_san)
@@ -573,10 +577,23 @@ def _character_dialog(
                         .classes('w-full')
                         .props('rows=2 autogrow')
                     )
-                conditions = ui.input(
-                    '状态，以中文逗号分隔',
-                    value='，'.join(character.conditions),
-                ).classes('w-full')
+                conditions = (
+                    ui.select(
+                        {
+                            **CONDITION_LABELS,
+                            **{
+                                value: value
+                                for value in character.conditions
+                                if value not in CONDITION_LABELS
+                            },
+                        },
+                        label='角色状态',
+                        value=character.conditions[:],
+                        multiple=True,
+                    )
+                    .props('use-chips')
+                    .classes('w-full')
+                )
             with ui.tab_panel(json_tab):
                 ui.label(
                     '这里保留装备、武器、职业配点、关系和创建骰点等完整字段。'
@@ -628,13 +645,7 @@ def _character_dialog(
                             for key, field in background_inputs.items()
                         },
                     },
-                    conditions=[
-                        value.strip()
-                        for value in conditions.value.replace(',', '，').split(
-                            '，'
-                        )
-                        if value.strip()
-                    ],
+                    conditions=conditions.value,
                 )
                 if not values['name']:
                     raise ValueError('请填写调查员姓名')
@@ -678,6 +689,101 @@ def _character_detail(character: Any) -> None:
                     CONDITION_LABELS.get(condition, condition),
                     color='secondary',
                 )
+
+
+def _character_view_dialog(character: Character) -> None:
+    with ui.dialog() as dialog, ui.card().classes('w-[820px] max-w-full p-6'):
+        with ui.row().classes('w-full items-center justify-between'):
+            ui.label(f'{character.name} · 角色档案').classes('record-title')
+            ui.button(icon='close', on_click=dialog.close).props(
+                'flat round aria-label="关闭角色档案"'
+            )
+        _character_detail(character)
+        with ui.tabs().classes('w-full') as tabs:
+            stats_tab = ui.tab('属性与技能')
+            background_tab = ui.tab('背景与经历')
+            items_tab = ui.tab('装备与资产')
+        with ui.tab_panels(tabs, value=stats_tab).classes('w-full'):
+            with ui.tab_panel(stats_tab):
+                with ui.grid().classes('attribute-grid w-full'):
+                    for key, value in character.attributes.items():
+                        ui.label(f'{key}  {value}').classes('notice text-sm')
+                ui.label(
+                    f'幸运 {character.luck} · 移动 {character.movement} · '
+                    f'体格 {character.build} · 伤害加值 '
+                    f'{character.damage_bonus}'
+                ).classes('muted my-4')
+                ui.table(
+                    columns=[
+                        {
+                            'name': 'skill',
+                            'label': '技能',
+                            'field': 'skill',
+                            'align': 'left',
+                            'sortable': True,
+                        },
+                        {
+                            'name': 'value',
+                            'label': '数值',
+                            'field': 'value',
+                            'sortable': True,
+                        },
+                        {
+                            'name': 'marked',
+                            'label': '成长标记',
+                            'field': 'marked',
+                        },
+                    ],
+                    rows=[
+                        {
+                            'skill': key,
+                            'value': value,
+                            'marked': '✓'
+                            if key in character.skill_marks
+                            else '',
+                        }
+                        for key, value in character.skills.items()
+                    ],
+                    row_key='skill',
+                    pagination=12,
+                ).classes('w-full')
+            with ui.tab_panel(background_tab):
+                for key, value in character.background.items():
+                    if value:
+                        ui.label(BACKGROUND_LABELS.get(key, key)).classes(
+                            'eyebrow mt-4'
+                        )
+                        ui.label(value).classes('whitespace-pre-wrap')
+                ui.label('调查经历').classes('record-title mt-5')
+                if not character.experiences:
+                    ui.label('尚未记录调查经历。').classes('muted')
+                for text in character.experiences:
+                    ui.markdown(text).classes('notice my-2')
+                if character.relationships:
+                    ui.label('人际关系').classes('record-title mt-5')
+                    for text in character.relationships:
+                        ui.label(text).classes('whitespace-pre-wrap')
+            with ui.tab_panel(items_tab):
+                for title, items in (
+                    ('随身物品', character.inventory),
+                    ('武器', character.weapons),
+                ):
+                    ui.label(title).classes('record-title mt-3')
+                    if not items:
+                        ui.label('未记录').classes('muted')
+                    for item in items:
+                        with ui.expansion(
+                            item.get('name', '未命名物品')
+                        ).classes('w-full'):
+                            ui.label(_json(item)).classes(
+                                'text-sm whitespace-pre-wrap'
+                            )
+                ui.label('资产').classes('record-title mt-4')
+                ui.label(_json(character.assets)).classes(
+                    'text-sm whitespace-pre-wrap'
+                )
+        ui.button('关闭', on_click=dialog.close).props('flat')
+    dialog.open()
 
 
 def _character_generate_dialog(platform: Any, refresh: Callable) -> None:
@@ -807,6 +913,13 @@ def _characters_page(platform: Any) -> None:
                                 '；'.join(character.import_warnings)
                             ).classes('notice text-sm')
                         if character.locked_game_id:
+                            ui.button(
+                                '查看角色档案',
+                                icon='badge',
+                                on_click=lambda item=character: (
+                                    _character_view_dialog(item)
+                                ),
+                            ).props('flat')
                             ui.link(
                                 '正在游戏中，查看当局角色',
                                 f'/games/{character.locked_game_id}',
@@ -863,23 +976,53 @@ async def _clone_character(
 
 def _scenario_review_dialog(platform: Any, refresh: Callable, item) -> None:
     scenario = item
-    with ui.dialog() as dialog, ui.card().classes('w-[1080px] max-w-full p-6'):
-        ui.label(scenario.title).classes('record-title')
-        ui.label('先检查秘密、出处与未解决问题，再批准用于开团。').classes(
-            'muted'
-        )
-        with ui.tabs().classes('w-full') as tabs:
+    blocks = {block.id: block for block in scenario.source_blocks}
+    pending_map_assets = None
+
+    def show_source(identity: str) -> None:
+        source_choice.set_value(identity)
+        tabs.set_value(source_tab)
+
+    def source_links(identities: list[str]) -> None:
+        if not identities:
+            return
+        with ui.row().classes('w-full gap-2 mt-3'):
+            for identity in identities:
+                block = blocks.get(identity)
+                if block is not None:
+                    ui.button(
+                        f'{block.file} · {block.locator}',
+                        icon='description',
+                        on_click=lambda key=identity: show_source(key),
+                    ).props('flat dense').classes('text-xs')
+
+    with (
+        ui.dialog() as dialog,
+        ui.card().classes('review-dialog w-[1180px] max-w-full p-0'),
+    ):
+        with ui.row().classes('w-full items-center justify-between p-5'):
+            with ui.column().classes('gap-1'):
+                ui.label(scenario.title).classes('record-title')
+                ui.label(
+                    '核对剧情与秘密，标注地图，然后批准用于开团。'
+                ).classes('muted')
+            ui.button(icon='close', on_click=dialog.close).props(
+                'flat round aria-label="关闭模组审核"'
+            )
+        with ui.tabs().classes('w-full border-b') as tabs:
             review_tab = ui.tab('审核')
+            scenes_tab = ui.tab('剧情档案')
+            maps_tab = ui.tab('地图与图片')
             source_tab = ui.tab('原文出处')
-            json_tab = ui.tab('编辑规范包')
-        with ui.tab_panels(tabs, value=review_tab).classes('w-full'):
+            json_tab = ui.tab('规范 JSON')
+        with ui.tab_panels(tabs, value=review_tab).classes('review-body'):
             with ui.tab_panel(review_tab):
                 ui.label(scenario.description or '尚未填写模组简介。')
                 ui.label(
                     f'{scenario.min_players}–{scenario.max_players} 位玩家 · '
                     f'{scenario.era} · {len(scenario.scenes)} 个场景 · '
                     f'{len(scenario.assets)} 份图片资料'
-                ).classes('muted')
+                ).classes('muted my-3')
                 resolutions = {}
                 if not scenario.review_issues:
                     ui.label(
@@ -894,13 +1037,11 @@ def _scenario_review_dialog(platform: Any, refresh: Callable, item) -> None:
                             color='secondary',
                         )
                         ui.label(issue.message)
-                        if issue.source_ids:
-                            ui.label(
-                                '关联出处：' + '、'.join(issue.source_ids)
-                            ).classes('muted')
+                        source_links(issue.source_ids)
                         resolutions[issue.id] = ui.checkbox(
                             '已核对并解决', value=issue.is_resolved
                         )
+            with ui.tab_panel(scenes_tab):
                 for role in scenario.roles:
                     with ui.expansion(f'角色 HO · {role.name}').classes(
                         'w-full'
@@ -909,65 +1050,218 @@ def _scenario_review_dialog(platform: Any, refresh: Callable, item) -> None:
                         ui.markdown(role.public_text or '未填写')
                         ui.label('仅该角色知道').classes('eyebrow mt-3')
                         ui.markdown(role.secret_text or '未填写')
-                for scene in scenario.scenes:
-                    with ui.expansion(scene.title).classes('w-full'):
-                        ui.label('公开描述').classes('eyebrow')
-                        ui.markdown(scene.public_text or '未填写')
-                        ui.label('主持人资料').classes('eyebrow mt-3')
-                        ui.markdown(scene.keeper_text or '未填写')
+                        source_links(role.source_ids)
+                category = (
+                    ui.select(
+                        {
+                            'scenes': '场景',
+                            'npcs': 'NPC',
+                            'clues': '线索',
+                            'handouts': '手册',
+                            'endings': '结局',
+                        },
+                        value='scenes',
+                        label='内容类型',
+                    )
+                    .classes('w-full mt-4')
+                    .props('outlined')
+                )
+                scene_choice = (
+                    ui.select(
+                        {value.id: value.title for value in scenario.scenes},
+                        value=scenario.scenes[0].id
+                        if scenario.scenes
+                        else None,
+                        label='选择条目，可输入名称查找',
+                        with_input=True,
+                    )
+                    .classes('w-full my-3')
+                    .props('outlined')
+                )
+
+                @ui.refreshable
+                def scene_detail() -> None:
+                    selected = next(
+                        (
+                            value
+                            for value in getattr(scenario, category.value)
+                            if value.id == scene_choice.value
+                        ),
+                        None,
+                    )
+                    if selected is None:
+                        ui.label('当前分类没有条目。').classes('muted')
+                        return
+                    if category.value == 'scenes':
+                        ui.label('公开描述候选').classes('eyebrow')
+                        ui.markdown(selected.public_text or '未填写')
+                        ui.label('主持人资料').classes('eyebrow mt-4')
+                        ui.markdown(selected.keeper_text or '未填写')
+                        if selected.conditions:
+                            ui.label('场景条件').classes('eyebrow mt-4')
+                            ui.label(_json(selected.conditions)).classes(
+                                'text-sm whitespace-pre-wrap'
+                            )
+                        scene_names = {
+                            scene.id: scene.title for scene in scenario.scenes
+                        }
+                        ui.label(
+                            '后继场景：'
+                            + (
+                                '、'.join(
+                                    scene_names.get(key, key)
+                                    for key in selected.next_scene_ids
+                                )
+                                or '无固定后继'
+                            )
+                        ).classes('muted mt-3')
+                    else:
+                        ui.badge(
+                            {
+                                'public': '公开',
+                                'keeper': '仅主持',
+                                'roles': '指定身份',
+                            }[selected.visibility]
+                        ).props('outline')
+                        ui.markdown(selected.text or '未填写')
+                    source_links(selected.source_ids)
+
+                def change_category() -> None:
+                    options = {
+                        value.id: value.title
+                        for value in getattr(scenario, category.value)
+                    }
+                    scene_choice.set_options(
+                        options, value=next(iter(options), None)
+                    )
+                    scene_detail.refresh()
+
+                category.on_value_change(change_category)
+                scene_choice.on_value_change(scene_detail.refresh)
+                scene_detail()
+            with ui.tab_panel(maps_tab):
+                ui.label(
+                    '打开图片后可标为地图，在图上放置地点、绘制区域，'
+                    '并设置每一项的可见范围。'
+                ).classes('muted mb-4')
+
+                @ui.refreshable
+                def images() -> None:
+                    if not scenario.assets:
+                        ui.label('导入资料中没有图片。').classes('muted')
+                    with ui.grid().classes('library-grid'):
+                        for asset in scenario.assets:
+                            with ui.card().classes('paper p-4 gap-3'):
+                                ui.image(
+                                    f'/api/v1/scenarios/{scenario.id}'
+                                    f'/assets/{asset.id}?v={scenario.version}'
+                                ).classes('review-asset-image').props(
+                                    'fit=contain'
+                                )
+                                ui.label(asset.name).classes('font-medium')
+                                ui.label(
+                                    f'{"地图" if asset.is_map else "图片"} · '
+                                    f'{len(asset.nodes)} 地点 · '
+                                    f'{len(asset.regions)} 区域'
+                                ).classes('muted text-xs')
+                                ui.button(
+                                    '编辑地图'
+                                    if asset.is_map
+                                    else '查看与标注',
+                                    icon='edit_location_alt',
+                                    on_click=lambda value=asset: (
+                                        open_scenario_map_editor(
+                                            platform,
+                                            scenario.id,
+                                            value.id,
+                                            map_saved,
+                                        )
+                                    ),
+                                ).props('outline')
+
+                images()
             with ui.tab_panel(source_tab):
                 ui.label(
                     f'作者：{scenario.author or "未标明"} · '
                     f'来源：{scenario.source or "未标明"}'
                 ).classes('muted')
                 ui.label(scenario.rights or '原资料的使用约定尚未填写。')
-                for block in scenario.source_blocks:
-                    with ui.expansion(
-                        f'{block.file} · {block.locator}'
-                    ).classes('w-full'):
-                        ui.label(block.id).classes('muted text-xs')
+                source_choice = (
+                    ui.select(
+                        {
+                            key: f'{value.file} · {value.locator}'
+                            for key, value in blocks.items()
+                        },
+                        value=next(iter(blocks), None),
+                        label='选择原文位置，可输入文件或页码查找',
+                        with_input=True,
+                    )
+                    .classes('w-full my-3')
+                    .props('outlined')
+                )
+
+                @ui.refreshable
+                def source_detail() -> None:
+                    block = blocks.get(source_choice.value)
+                    if block is None:
+                        ui.label('没有原文出处记录。').classes('muted')
+                    else:
                         ui.label(block.text).classes('whitespace-pre-wrap')
+
+                source_choice.on_value_change(source_detail.refresh)
+                source_detail()
             with ui.tab_panel(json_tab):
                 ui.label(
-                    '编辑场景、线索、地图节点与可见范围。保存后保持待审核状态。'
-                ).classes('muted')
+                    '完整结构的高级编辑。地图也可以在“地图与图片”中直接标注。'
+                ).classes('muted mb-3')
                 editor = ui.textarea(value=scenario.model_dump_json(indent=2))
                 editor.classes('w-full json-editor').props('rows=18')
+
+        def map_saved() -> None:
+            nonlocal scenario, pending_map_assets
+            latest = platform.scenarios.get(scenario.id)
+            assets = [asset.model_dump(mode='json') for asset in latest.assets]
+            try:
+                values = json.loads(editor.value)
+                if not isinstance(values, dict):
+                    raise ValueError('模组 JSON 需要对象')
+            except (TypeError, ValueError):
+                pending_map_assets = assets
+                ui.notify(
+                    '地图已保存。规范 JSON 内容已保留，请修正后再保存；'
+                    '保存时会合并最新地图标注。',
+                    type='warning',
+                )
+            else:
+                values['assets'] = assets
+                values['version'] = latest.version
+                values['status'] = latest.status
+                editor.set_value(_json(values))
+                pending_map_assets = None
+            scenario = latest
+            images.refresh()
 
         def save_package() -> Scenario:
             values = json.loads(editor.value)
             if values.get('id') != scenario.id:
                 raise ValueError('不能修改模组 ID')
+            if pending_map_assets is not None:
+                values['assets'] = pending_map_assets
+                values['version'] = scenario.version
             values['status'] = 'draft'
             revised = Scenario.model_validate(values)
             for issue in revised.review_issues:
-                original = next(
-                    (
-                        value
-                        for value in scenario.review_issues
-                        if value.id == issue.id
-                    ),
-                    None,
-                )
-                if (
-                    issue.id in resolutions
-                    and original is not None
-                    and resolutions[issue.id].value != original.is_resolved
-                ):
+                if issue.id in resolutions:
                     issue.is_resolved = resolutions[issue.id].value
-            platform.scenarios.save(revised)
-            return revised
+            return platform.scenarios.save(revised)
 
         async def save() -> None:
-            if (
-                await _perform(save_package, '规范包已保存，请继续审核')
-                is not None
-            ):
+            if await _perform(save_package, '规范包已保存，请继续审核'):
                 dialog.close()
                 refresh()
 
         async def approve() -> None:
-            async def action() -> bool:
+            def action() -> bool:
                 save_package()
                 platform.scenarios.approve(scenario.id)
                 return True
@@ -976,10 +1270,11 @@ def _scenario_review_dialog(platform: Any, refresh: Callable, item) -> None:
                 dialog.close()
                 refresh()
 
-        with ui.row().classes('w-full justify-end mt-3'):
+        with ui.row().classes('dialog-actions w-full justify-end'):
             ui.button('关闭', on_click=dialog.close).props('flat')
-            ui.button('保存修改', on_click=save).props('outline')
+            ui.button('保存草稿', on_click=save).props('outline')
             ui.button('批准用于开团', on_click=approve, icon='task_alt')
+        dialog.on('hide', refresh)
     dialog.open()
 
 
@@ -1073,14 +1368,21 @@ def _scenarios_page(platform: Any) -> None:
                             f'{scenario.max_players} 人 · '
                             f'{scenario.era} · {len(scenario.assets)} 份资料'
                         ).classes('muted')
-                        remaining = sum(
-                            not issue.is_resolved
+                        unresolved = [
+                            issue
                             for issue in scenario.review_issues
+                            if not issue.is_resolved
+                        ]
+                        blockers = sum(
+                            issue.severity == 'blocker' for issue in unresolved
                         )
-                        if remaining:
-                            ui.label(f'{remaining} 项问题待核对').classes(
-                                'notice'
+                        if blockers:
+                            ui.label(f'{blockers} 项阻塞问题待处理').classes(
+                                'notice text-sm'
                             )
+                        warnings = len(unresolved) - blockers
+                        if warnings:
+                            ui.label(f'{warnings} 项导入提醒').classes('muted')
                         ui.button(
                             '查看与审核',
                             on_click=lambda item=scenario: (
@@ -1318,6 +1620,8 @@ def _render_event(event: dict, names: dict) -> None:
     classes = 'story-event w-full'
     if event.get('kind') == 'narration':
         classes += ' keeper'
+    elif event.get('kind') in ('check', 'contest'):
+        classes += ' roll'
     with ui.column().classes(classes):
         meta = f'{sequence} · {title}' + (f' · {time}' if time else '')
         if event.get('is_private'):
@@ -1357,8 +1661,17 @@ class GameReader:
         self.actor_id: str | None = None
         self.seen_ids: set[str] = set()
         self.side_signature = ''
+        self.asset_signature = ''
+        self.clue_signature = ''
+        self.sidebar_panels: dict = {}
         self.is_refreshing = False
         self.is_busy = False
+        self.event_limit = 80
+        self.event_filter = 'story'
+        self.event_search = ''
+        self.displayed_ids: list[str] = []
+        self.is_following = True
+        self.event_ceiling: int | None = None
         self.view: dict = {}
         self.names = {actor.id: actor.name for actor in platform.list_actors()}
         self.build()
@@ -1366,31 +1679,79 @@ class GameReader:
     def build(self) -> None:
         game = self.platform.get_game(self.game_id)
         _shell(game.name, '/games')
-        with ui.column().classes('workspace gap-2'):
-            with ui.row().classes('w-full justify-between items-start gap-3'):
+        with ui.column().classes('workspace reader-workspace'):
+            with ui.row().classes(
+                'reader-heading w-full justify-between items-center gap-3'
+            ):
                 with ui.column().classes('gap-1'):
                     ui.label('调查阅读台').classes('eyebrow')
                     ui.label(game.name).classes('page-title')
                     self.scene_label = ui.label().classes('muted')
-                self.status_label = ui.label().classes('notice text-sm')
+                self.status_label = ui.label().classes('reader-status')
             self.error_label = ui.label().classes('notice text-sm w-full')
             self.error_label.set_visibility(False)
             self._toolbar(game)
-            with ui.grid().classes('reader-grid mt-5'):
-                self.characters_panel = ui.column().classes(
-                    'paper panel reader-sidebar character-sidebar gap-4'
+            with ui.grid().classes('reader-grid'):
+                with ui.column().classes(
+                    'paper reader-sidebar character-sidebar'
+                ):
+                    with ui.row().classes('reader-section-header w-full'):
+                        ui.label('调查员').classes('record-title')
+                    with ui.scroll_area().classes('reader-scroll'):
+                        self.characters_panel = ui.column().classes(
+                            'reader-sidebar-content'
+                        )
+                with ui.column().classes('paper reader-paper'):
+                    self._log_toolbar()
+                    with ui.scroll_area(on_scroll=self._story_scroll).classes(
+                        'reader-scroll'
+                    ) as self.story_scroll:
+                        with ui.column().classes('reader-events gap-0'):
+                            self.older_button = (
+                                ui.button(
+                                    '载入更早记录',
+                                    icon='history',
+                                    on_click=self.load_older,
+                                )
+                                .props('flat dense')
+                                .classes('self-center mb-5')
+                            )
+                            self.empty_label = ui.label(
+                                '主持人尚未开场。使用“推进一步”开始。'
+                            ).classes('muted')
+                            self.events_panel = ui.column().classes(
+                                'w-full gap-0'
+                            )
+                with ui.column().classes('paper reader-sidebar map-sidebar'):
+                    with ui.tabs().classes('reader-tabs') as tabs:
+                        maps_tab = ui.tab('地图与图片')
+                        clues_tab = ui.tab('线索与手册')
+                    with ui.tab_panels(tabs, value=maps_tab):
+                        with ui.tab_panel(maps_tab):
+                            with ui.scroll_area().classes('reader-scroll'):
+                                self.assets_panel = ui.column().classes(
+                                    'reader-sidebar-content'
+                                )
+                        with ui.tab_panel(clues_tab):
+                            with ui.scroll_area().classes('reader-scroll'):
+                                self.clues_panel = ui.column().classes(
+                                    'reader-sidebar-content'
+                                )
+            with ui.row().classes('reader-footer'):
+                self.usage_label = ui.label()
+                ui.label('空格：开始 / 暂停 · →：推进一步').classes(
+                    'keyboard-hint'
                 )
-                with ui.column().classes('paper reader-paper gap-0'):
-                    self.empty_label = ui.label(
-                        '主持人尚未开场。使用“推进一步”或“自动进行”开始。'
-                    ).classes('muted')
-                    self.events_panel = ui.column().classes('w-full gap-0')
-                self.assets_panel = ui.column().classes(
-                    'paper panel reader-sidebar map-sidebar gap-4'
-                )
+                self.follow_checkbox = ui.checkbox(
+                    '跟随最新', value=True, on_change=self._follow_changed
+                ).props('dense size=xs')
         self.refresh()
         ui.timer(2, self.refresh)
-        ui.keyboard(on_key=self._key, repeating=False)
+        ui.keyboard(
+            on_key=self._key,
+            repeating=False,
+            ignore=['input', 'select', 'button', 'textarea', 'div', 'a'],
+        )
 
     def _toolbar(self, game: Game) -> None:
         options = {'__global__': '主持人资料与全局记录'}
@@ -1398,7 +1759,7 @@ class GameReader:
             options[seat.actor_id] = (
                 self.names.get(seat.actor_id, '调查员') + '所见'
             )
-        with ui.row().classes('reader-toolbar w-full my-3 items-center'):
+        with ui.row().classes('reader-toolbar w-full'):
             self.auto_button = ui.button(
                 '自动进行', icon='play_arrow', on_click=self.toggle_run
             )
@@ -1408,37 +1769,105 @@ class GameReader:
             ui.button(
                 '介入游戏', icon='edit_note', on_click=self.intervention
             ).props('flat')
-            self.sync_button = ui.button(
-                '核对叙事时空',
-                icon='update',
-                on_click=self.synchronise_controls,
+            self.map_button = ui.button(
+                '地图位置',
+                icon='edit_location_alt',
+                on_click=self.map_management,
             ).props('flat')
-            self.sync_button.tooltip('暂停并核对已完成叙事的日期、时间和场景')
             ui.button(
                 '角色与地图', icon='map', on_click=self.sidebar_dialog
             ).props('flat').classes('mobile-sidebar-button')
-            ui.space()
             ui.select(
                 options,
                 value='__global__',
                 label='阅读视角',
                 on_change=self.change_view,
-            ).classes('min-w-[230px]')
+            ).classes('reader-view-select').props('outlined dense')
             with ui.button(icon='more_horiz').props(
                 'flat round aria-label="对局操作"'
             ):
                 with ui.menu():
                     ui.menu_item('调整运行预算', on_click=self.budget_dialog)
-                    ui.menu_item(
-                        '管理地图位置与可见区域', on_click=self.map_management
+                    self.sync_button = ui.menu_item(
+                        '核对叙事时空', on_click=self.synchronise_controls
                     )
                     ui.menu_item('外部 Agent 接入', on_click=self.agent_dialog)
                     ui.menu_item('导出当前视角记录', on_click=self.export)
                     ui.menu_item('结束本局', on_click=self.finish_dialog)
-            self.usage_label = ui.label().classes('muted text-xs w-full')
-            ui.label('空格：开始 / 暂停 · →：推进一步').classes(
-                'muted text-xs'
+
+    def _log_toolbar(self) -> None:
+        with ui.row().classes('reader-log-tools'):
+            ui.select(
+                {
+                    'story': '剧情与骰点',
+                    'narration': '主持叙事',
+                    'all': '所有记录',
+                },
+                value=self.event_filter,
+                on_change=self.filter_events,
+            ).props('outlined dense aria-label="记录类型"')
+            ui.input(
+                placeholder='搜索当前视角记录',
+                on_change=self.search_events,
+            ).props('outlined dense clearable debounce=300').on(
+                'keydown.enter', lambda: None
             )
+            ui.button(
+                icon='vertical_align_bottom', on_click=self.jump_latest
+            ).props('flat round dense aria-label="跳到最新记录"')
+            self.new_events_button = ui.button(
+                '有新记录', on_click=self.jump_latest
+            ).props('flat dense')
+            self.new_events_button.set_visibility(False)
+
+    def _story_scroll(self, event: Any) -> None:
+        self.is_following = event.vertical_percentage >= 0.96
+        self.follow_checkbox.set_value(self.is_following)
+
+    def _follow_changed(self, event: Any) -> None:
+        self.is_following = bool(event.value)
+        if self.is_following:
+            self.event_ceiling = None
+            self._append_events()
+            self.story_scroll.scroll_to(percent=1)
+        elif self.event_ceiling is None:
+            self.event_ceiling = max(
+                (
+                    _data(item).get('sequence', 0)
+                    for item in self.view.get('events', [])
+                ),
+                default=0,
+            )
+
+    def jump_latest(self) -> None:
+        self.is_following = True
+        self.event_ceiling = None
+        self.follow_checkbox.set_value(True)
+        self._append_events()
+        self.story_scroll.scroll_to(percent=1)
+
+    def filter_events(self, event: Any) -> None:
+        self.event_filter = event.value
+        self._reset_events()
+
+    def search_events(self, event: Any) -> None:
+        self.event_search = (event.value or '').strip().casefold()
+        self._reset_events()
+
+    def _reset_events(self) -> None:
+        self.events_panel.clear()
+        self.seen_ids.clear()
+        self.displayed_ids.clear()
+        self.event_limit = 80
+        self.event_ceiling = None
+        self._append_events()
+
+    def load_older(self) -> None:
+        self.event_limit += 80
+        self.is_following = False
+        self.follow_checkbox.set_value(False)
+        self._append_events()
+        self.story_scroll.scroll_to(percent=0)
 
     def refresh(self) -> None:
         if self.is_refreshing:
@@ -1452,15 +1881,25 @@ class GameReader:
             self.status_label.set_text(
                 STATUS_LABELS.get(game.status, game.status)
             )
+            scene_title = next(
+                (
+                    scene['title']
+                    for scene in self.view.get('scenario', {}).get(
+                        'scenes', []
+                    )
+                    if scene['id'] == game.scene_id
+                ),
+                '当前地点未公开' if game.scene_id else '尚未开场',
+            )
+            hour, minute = divmod(round(game.hour * 60), 60)
             self.scene_label.set_text(
-                f'第 {game.day + 1} 天 · {game.hour:g} 时 · '
+                f'第 {game.day + 1} 天 · {hour:02d}:{minute:02d} · '
                 f'{"战斗" if game.mode == "combat" else "自由调查"} · '
-                f'场景 {game.scene_id or "尚未开场"} · 镜头 {game.group_id}'
+                f'{scene_title}'
             )
             self.usage_label.set_text(
-                f'叙事节点 {game.node_count} / {game.budget_nodes} · '
-                f'平台 API tokens {game.token_usage:,} / '
-                f'{game.budget_tokens:,}，不含外部 Agent 用量'
+                f'节点 {game.node_count} / {game.budget_nodes} · '
+                f'API tokens {game.token_usage:,} / {game.budget_tokens:,}'
             )
             self.error_label.set_text(game.last_error)
             self.error_label.set_visibility(bool(game.last_error))
@@ -1478,6 +1917,7 @@ class GameReader:
                 not is_ended and game.status != 'running' and not self.is_busy
             )
             self.sync_button.set_enabled(not is_ended and not self.is_busy)
+            self.map_button.set_visibility(self.actor_id is None)
             characters = [
                 _data(item) for item in self.view.get('characters', [])
             ]
@@ -1488,18 +1928,46 @@ class GameReader:
             signature = _json(
                 {
                     'characters': characters,
-                    'assets': self.view.get('assets', []),
                     'invitations': self.view.get('invitations', []),
                 }
             )
             if signature != self.side_signature:
                 self.side_signature = signature
-                self.characters_panel.clear()
-                with self.characters_panel:
-                    self._characters(characters)
-                self.assets_panel.clear()
-                with self.assets_panel:
-                    self._assets()
+                for panel in (
+                    self.characters_panel,
+                    self.sidebar_panels.get('characters'),
+                ):
+                    if panel is not None:
+                        panel.clear()
+                        with panel:
+                            self._characters(characters)
+            assets_signature = _json(self.view.get('assets', []))
+            if assets_signature != self.asset_signature:
+                self.asset_signature = assets_signature
+                for panel in (
+                    self.assets_panel,
+                    self.sidebar_panels.get('assets'),
+                ):
+                    if panel is not None:
+                        panel.clear()
+                        with panel:
+                            self._assets()
+            clues_signature = _json(
+                {
+                    category: self.view.get('scenario', {}).get(category, [])
+                    for category in ('clues', 'handouts')
+                }
+            )
+            if clues_signature != self.clue_signature:
+                self.clue_signature = clues_signature
+                for panel in (
+                    self.clues_panel,
+                    self.sidebar_panels.get('clues'),
+                ):
+                    if panel is not None:
+                        panel.clear()
+                        with panel:
+                            self._clues()
         except Exception as error:
             self.error_label.set_text(str(error))
             self.error_label.set_visibility(True)
@@ -1507,11 +1975,71 @@ class GameReader:
             self.is_refreshing = False
 
     def _append_events(self) -> None:
+        if not self.is_following and self.event_ceiling is None:
+            self.event_ceiling = max(
+                (
+                    _data(item).get('sequence', 0)
+                    for item in self.view.get('events', [])
+                ),
+                default=0,
+            )
         events = sorted(
             (_data(item) for item in self.view.get('events', [])),
             key=lambda item: item.get('sequence', 0),
         )
+        if self.event_filter == 'narration':
+            events = [item for item in events if item['kind'] == 'narration']
+        elif self.event_filter == 'story':
+            events = [
+                item
+                for item in events
+                if item['kind']
+                in (
+                    'narration',
+                    'player',
+                    'reaction',
+                    'check',
+                    'contest',
+                    'intervention',
+                )
+            ]
+        if self.event_search:
+            events = [
+                item
+                for item in events
+                if self.event_search
+                in ' '.join(_event_content(item, self.names)).casefold()
+            ]
+        if self.event_ceiling is not None:
+            new_count = sum(
+                item.get('sequence', 0) > self.event_ceiling for item in events
+            )
+            events = [
+                item
+                for item in events
+                if item.get('sequence', 0) <= self.event_ceiling
+            ]
+        else:
+            new_count = 0
+        self.new_events_button.set_text(f'{new_count} 条新记录')
+        self.new_events_button.set_visibility(bool(new_count))
+        self.older_button.set_visibility(len(events) > self.event_limit)
+        events = events[-self.event_limit :]
         self.empty_label.set_visibility(not events)
+        if not events:
+            self.empty_label.set_text(
+                '没有符合筛选的记录。试试其他类型或清空搜索。'
+                if self.event_search or self.event_filter != 'story'
+                else '主持人尚未开场。使用“推进一步”开始。'
+            )
+        identifiers = [
+            str(item.get('id', item.get('sequence'))) for item in events
+        ]
+        if identifiers == self.displayed_ids:
+            return
+        if identifiers[: len(self.displayed_ids)] != self.displayed_ids:
+            self.events_panel.clear()
+            self.seen_ids.clear()
         with self.events_panel:
             for event in events:
                 event_id = str(event.get('id', event.get('sequence')))
@@ -1519,11 +2047,31 @@ class GameReader:
                     continue
                 _render_event(event, self.names)
                 self.seen_ids.add(event_id)
+        self.displayed_ids = identifiers
+        if self.is_following:
+            self.story_scroll.scroll_to(percent=1)
 
     def _characters(self, characters: list[dict]) -> None:
-        ui.label('调查员').classes('record-title')
+        invitations = [
+            _data(item)
+            for item in self.view.get('invitations', [])
+            if _data(item).get('status') in ('pending', 'claimed')
+        ]
+        if invitations:
+            with ui.column().classes('waiting-list w-full gap-1'):
+                ui.label(
+                    '待续回应'
+                    if self.view['game']['status'] == 'paused'
+                    else '当前等待'
+                ).classes('eyebrow')
+                for invitation in invitations:
+                    ui.label(
+                        self.names.get(
+                            invitation.get('actor_id'), '外部 Agent'
+                        )
+                    ).classes('text-sm')
         for values in characters:
-            with ui.column().classes('w-full gap-2'):
+            with ui.column().classes('investigator-card'):
                 if 'attributes' not in values:
                     ui.label(values['name']).classes('record-title')
                     ui.label(values.get('occupation') or '职业未填').classes(
@@ -1532,52 +2080,90 @@ class GameReader:
                     ui.separator()
                     continue
                 character = Character.model_validate(values)
-                _character_detail(character)
-                if character.background:
-                    with ui.expansion('背景档案').classes('w-full'):
-                        for key, value in character.background.items():
-                            ui.label(BACKGROUND_LABELS.get(key, key)).classes(
-                                'eyebrow mt-2'
+                ui.label(character.name).classes('record-title')
+                ui.label(character.occupation or '职业未填').classes('muted')
+                with ui.grid().classes('investigator-stats'):
+                    for title, current, maximum in (
+                        ('HP', character.current_hp, character.max_hp),
+                        ('MP', character.current_mp, character.max_mp),
+                        ('SAN', character.current_san, character.max_san),
+                    ):
+                        with ui.column().classes('investigator-stat'):
+                            ui.label(title).classes('muted')
+                            ui.label(f'{current}/{maximum}').classes(
+                                'stat-value'
                             )
-                            ui.label(value).classes(
-                                'text-sm whitespace-pre-wrap'
-                            )
+                for condition in character.conditions:
+                    ui.badge(
+                        CONDITION_LABELS.get(condition, condition),
+                        color='secondary',
+                    ).props('outline')
+                ui.button(
+                    '查看角色档案',
+                    icon='badge',
+                    on_click=lambda item=character: _character_view_dialog(
+                        item
+                    ),
+                ).props('flat dense')
             ui.separator()
-        invitations = [
-            _data(item)
-            for item in self.view.get('invitations', [])
-            if _data(item).get('status') in ('pending', 'claimed')
-        ]
-        if invitations:
-            ui.label('等待回应').classes('eyebrow')
-            for invitation in invitations:
-                ui.label(
-                    self.names.get(invitation.get('actor_id'), '外部 Agent')
-                ).classes('text-sm')
 
     def _assets(self) -> None:
-        ui.label('地图与资料').classes('record-title')
-        assets = self.view.get('assets', [])
+        assets = sorted(
+            self.view.get('assets', []),
+            key=lambda item: not _data(item).get('is_map'),
+        )
         if not assets:
-            ui.label('这个视角尚没有可见的地图或图片资料。').classes('muted')
+            ui.icon('map', size='28px').classes('muted')
+            ui.label('当前没有可见的地图或图片。').classes('muted')
+            if self.actor_id is None:
+                ui.label('可在模组审核的“地图与图片”中标注地图。').classes(
+                    'muted text-xs'
+                )
         for value in assets:
             asset = _data(value)
-            ui.label(asset.get('name', '图片资料')).classes('font-medium')
-            url = asset.get('url', '')
-            if url:
-                ui.image(url).classes('w-full rounded').on(
-                    'click', lambda _, item=asset: self.map_dialog(item)
-                )
-                ui.button(
-                    '展开查看',
-                    icon='open_in_full',
-                    on_click=lambda item=asset: self.map_dialog(item),
-                ).props('flat dense')
-            for node in asset.get('nodes', []):
-                ui.label(
-                    node.get('label', node.get('name', '未命名地点'))
-                ).classes('text-sm')
-            self._map_legend(asset)
+            with ui.column().classes('reader-asset'):
+                with ui.row().classes('w-full items-center gap-2'):
+                    ui.icon('map' if asset.get('is_map') else 'image')
+                    ui.label(asset.get('name', '图片资料')).classes(
+                        'font-medium text-sm'
+                    )
+                url = asset.get('url', '')
+                if url:
+                    ui.image(url).classes('w-full rounded').props(
+                        'fit=contain'
+                    ).on('click', lambda _, item=asset: self.map_dialog(item))
+                    ui.button(
+                        '展开地图' if asset.get('is_map') else '查看图片',
+                        icon='open_in_full',
+                        on_click=lambda item=asset: self.map_dialog(item),
+                    ).props('flat dense')
+                if asset.get('is_map') and self.actor_id is None:
+                    ui.button(
+                        '调整位置与揭示',
+                        icon='edit_location_alt',
+                        on_click=lambda item=asset: open_game_map_editor(
+                            self.platform,
+                            self.game_id,
+                            item['id'],
+                            self.refresh,
+                        ),
+                    ).props('flat dense')
+                self._map_legend(asset)
+
+    def _clues(self) -> None:
+        scenario = self.view.get('scenario', {})
+        has_contents = False
+        for category, label in (('clues', '线索'), ('handouts', '手册')):
+            items = scenario.get(category, [])
+            if not items:
+                continue
+            has_contents = True
+            ui.label(label).classes('eyebrow')
+            for item in items:
+                with ui.expansion(item['title']).classes('reader-clue w-full'):
+                    ui.markdown(item.get('text', '')).classes('text-sm w-full')
+        if not has_contents:
+            ui.label('当前视角还没有可见的线索或手册。').classes('muted')
 
     def _map_legend(self, asset: dict) -> None:
         for index, character_id in enumerate(
@@ -1601,33 +2187,51 @@ class GameReader:
                 ui.button(icon='close', on_click=dialog.close).props(
                     'flat round aria-label="关闭图片"'
                 )
-            ui.image(asset.get('url', '')).classes('w-full').props(
-                'fit=contain'
-            )
-            for node in asset.get('nodes', []):
-                ui.label(_json(node)).classes('text-sm whitespace-pre-wrap')
+            render_map(asset, names=self.names, height='62vh')
             self._map_legend(asset)
         dialog.open()
 
     def sidebar_dialog(self) -> None:
+        panels = {}
         with (
             ui.dialog() as dialog,
             ui.card().classes('w-[760px] max-w-full p-5'),
         ):
+            with ui.row().classes('w-full items-center justify-between'):
+                ui.label('角色与资料').classes('record-title')
+                ui.button(icon='close', on_click=dialog.close).props(
+                    'flat round aria-label="关闭角色与资料"'
+                )
             with ui.tabs().classes('w-full') as tabs:
                 characters_tab = ui.tab('角色')
                 maps_tab = ui.tab('地图与资料')
+                clues_tab = ui.tab('线索与手册')
             with ui.tab_panels(tabs, value=characters_tab).classes('w-full'):
                 with ui.tab_panel(characters_tab):
-                    self._characters(
-                        [
-                            _data(item)
-                            for item in self.view.get('characters', [])
-                        ]
-                    )
+                    with ui.column().classes('w-full gap-3') as panel:
+                        panels['characters'] = panel
+                        self._characters(
+                            [
+                                _data(item)
+                                for item in self.view.get('characters', [])
+                            ]
+                        )
                 with ui.tab_panel(maps_tab):
-                    self._assets()
+                    with ui.column().classes('w-full gap-3') as panel:
+                        panels['assets'] = panel
+                        self._assets()
+                with ui.tab_panel(clues_tab):
+                    with ui.column().classes('w-full gap-3') as panel:
+                        panels['clues'] = panel
+                        self._clues()
             ui.button('关闭', on_click=dialog.close).props('flat')
+        self.sidebar_panels = panels
+
+        def detach() -> None:
+            if self.sidebar_panels is panels:
+                self.sidebar_panels = {}
+
+        dialog.on('hide', detach)
         dialog.open()
 
     def finish_dialog(self) -> None:
@@ -1702,143 +2306,56 @@ class GameReader:
         dialog.open()
 
     def map_management(self) -> None:
+        if self.actor_id is not None:
+            return
         game = self.platform.get_game(self.game_id)
         scenario = self.platform.games.scenario(game)
-        maps = {asset.id: asset for asset in scenario.assets if asset.is_map}
-        if not maps:
-            ui.notify('当前模组没有已审核的地图', type='info')
-            return
-        cards = {
-            card['id']: card
-            for card in self.platform.get_game_view(self.game_id)['characters']
+        maps = {
+            asset.id: asset.name for asset in scenario.assets if asset.is_map
         }
+        if not maps:
+            ui.notify(
+                '当前模组没有地图。请在模组审核的“地图与图片”中标注后开团。',
+                type='info',
+            )
+            return
+        if len(maps) == 1:
+            open_game_map_editor(
+                self.platform, self.game_id, next(iter(maps)), self.refresh
+            )
+            return
         with (
             ui.dialog() as dialog,
-            ui.card().classes('w-[960px] max-w-full p-6'),
+            ui.card().classes('w-[500px] max-w-full p-5'),
         ):
-            ui.label('地图位置与可见区域').classes('record-title')
-            chosen = ui.select(
-                {key: asset.name for key, asset in maps.items()},
-                value=next(iter(maps)),
-                label='地图',
-            ).classes('w-full')
-            positions_fields = {}
-            regions_fields = {}
+            ui.label('选择需要调整的地图').classes('record-title')
+            chosen = (
+                ui.select(maps, value=next(iter(maps)), label='地图')
+                .classes('w-full')
+                .props('outlined')
+            )
 
-            @ui.refreshable
-            def fields() -> None:
-                positions_fields.clear()
-                regions_fields.clear()
-                asset = maps[chosen.value]
-                ui.image(f'/api/v1/games/{game.id}/assets/{asset.id}').classes(
-                    'w-full max-h-[320px]'
-                ).props('fit=contain')
-                with ui.expansion('已审核的地图节点与区域').classes('w-full'):
-                    ui.label(
-                        _json({'nodes': asset.nodes, 'regions': asset.regions})
-                    ).classes('text-xs whitespace-pre-wrap')
-                current_positions = game.flags.get('map_positions', {}).get(
-                    asset.id, {}
+            def edit() -> None:
+                dialog.close()
+                open_game_map_editor(
+                    self.platform, self.game_id, chosen.value, self.refresh
                 )
-                current_regions = game.flags.get('map_regions', {}).get(
-                    asset.id, {}
-                )
-                node_names = {
-                    node['id']: node.get('name', node.get('label', node['id']))
-                    for node in asset.nodes
-                    if node.get('id')
-                }
-                region_names = {
-                    region['id']: region.get('name', region['id'])
-                    for region in asset.regions
-                }
-                for seat in game.seats:
-                    card = cards[seat.character_id]
-                    position = current_positions.get(card['id'], {})
-                    ui.label(card['name']).classes('record-title mt-3')
-                    with ui.grid().classes('form-grid w-full'):
-                        node = ui.select(
-                            node_names,
-                            label='所在节点，可留空',
-                            value=position.get('node_id'),
-                            clearable=True,
-                        )
-                        region = ui.select(
-                            region_names,
-                            label='向该角色揭示的区域',
-                            value=[
-                                identity
-                                for identity in current_regions.get(
-                                    seat.actor_id, []
-                                )
-                                if identity in region_names
-                            ],
-                            multiple=True,
-                        ).props('use-chips')
-                        x = ui.number(
-                            '位置 X / 0–1',
-                            value=position.get('x'),
-                            min=0,
-                            max=1,
-                            step=0.01,
-                        )
-                        y = ui.number(
-                            '位置 Y / 0–1',
-                            value=position.get('y'),
-                            min=0,
-                            max=1,
-                            step=0.01,
-                        )
-                    positions_fields[card['id']] = (node, x, y)
-                    regions_fields[seat.actor_id] = region
-                ui.label(
-                    '选节点或填写一对归一化坐标。同时填写时使用节点。'
-                ).classes('muted')
-
-            chosen.on_value_change(lambda: fields.refresh())
-            fields()
-
-            async def save() -> None:
-                async def apply() -> bool:
-                    positions = {}
-                    for character_id, (node, x, y) in positions_fields.items():
-                        if node.value:
-                            positions[character_id] = {'node_id': node.value}
-                        elif x.value is not None or y.value is not None:
-                            if x.value is None or y.value is None:
-                                raise ValueError('位置坐标需要同时填写 X 与 Y')
-                            positions[character_id] = {
-                                'x': x.value,
-                                'y': y.value,
-                            }
-                    regions = {
-                        actor_id: field.value
-                        for actor_id, field in regions_fields.items()
-                    }
-                    result = self.platform.games.update_map(
-                        self.game_id,
-                        chosen.value,
-                        positions,
-                        regions,
-                    )
-                    if inspect.isawaitable(result):
-                        await result
-                    return True
-
-                if await _perform(apply, '地图位置与可见区域已保存'):
-                    dialog.close()
-                    self.refresh()
 
             with ui.row().classes('w-full justify-end'):
                 ui.button('取消', on_click=dialog.close).props('flat')
-                ui.button('保存地图状态', on_click=save, icon='save')
+                ui.button('打开地图', icon='map', on_click=edit)
         dialog.open()
 
     def change_view(self, event: Any) -> None:
         self.actor_id = None if event.value == '__global__' else event.value
         self.events_panel.clear()
         self.seen_ids.clear()
+        self.displayed_ids.clear()
+        self.event_ceiling = None
+        self.event_limit = 80
         self.side_signature = ''
+        self.asset_signature = ''
+        self.clue_signature = ''
         self.refresh()
 
     async def _operate(self, action: Callable, success: str = '') -> None:
@@ -1873,7 +2390,19 @@ class GameReader:
             await self._operate(lambda: self.platform.run_game(self.game_id))
 
     async def _key(self, event: Any) -> None:
-        if not event.action.keydown or event.modifiers.ctrl:
+        if not event.action.keydown or any(
+            (
+                event.modifiers.ctrl,
+                event.modifiers.alt,
+                event.modifiers.meta,
+                event.modifiers.shift,
+            )
+        ):
+            return
+        if any(
+            isinstance(element, Dialog) and element.value
+            for element in event.client.elements.values()
+        ):
             return
         if event.key.space:
             await self.toggle_run()

@@ -2415,7 +2415,9 @@ class GameService:
                 }
             await asyncio.sleep(0.2)
 
-    def asset_path(self, game_id, asset_id, actor_id=None) -> Path:
+    def asset_path(
+        self, game_id, asset_id, actor_id=None, *, include_markers=True
+    ) -> Path:
         game = self.get(game_id)
         seat = next(
             (seat for seat in game.seats if seat.actor_id == actor_id), None
@@ -2433,6 +2435,8 @@ class GameService:
             .get(asset_id, {})
             .get(actor_id, []),
         )
+        if not include_markers:
+            return path
         positions = self._visible_positions(game, asset_id, actor_id)
         if not positions:
             return path

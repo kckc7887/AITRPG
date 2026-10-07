@@ -5,6 +5,7 @@ import base64
 import hashlib
 import io
 import json
+import math
 import re
 import shutil
 import time
@@ -360,7 +361,7 @@ def _validate_structure(scenario: Scenario) -> list[ReviewIssue]:
                     )
     for asset in scenario.assets:
         try:
-            _region_shapes(asset)
+            _validate_map_annotations(asset, scenario)
         except ValueError as error:
             issues.append(
                 ReviewIssue(message=f'{asset.id}：{error}', severity='blocker')
@@ -438,28 +439,44 @@ def _normalize_scene_participants(scenario: Scenario) -> None:
             scene.conditions['participants'] = participants
 
 
-def _region_shapes(asset: ScenarioAsset) -> list[dict[str, Any]]:
+def _normalized_coordinate(value):
+    return (
+        type(value) in (int, float)
+        and math.isfinite(value)
+        and 0 <= value <= 1
+    )
+
+
+def _annotation_ids(items, label):
     identities = set()
-    for region in asset.regions:
-        identity = region.get('id')
+    for item in items:
+        identity = item.get('id')
         if (
             not isinstance(identity, str)
-            or not identity
+            or not identity.strip()
+            or identity != identity.strip()
             or identity in identities
         ):
-            raise ValueError('地图区域需要唯一非空标识')
+            raise ValueError(f'地图{label}需要唯一非空标识')
         identities.add(identity)
+    return identities
+
+
+def _region_shapes(asset: ScenarioAsset) -> list[dict[str, Any]]:
+    _annotation_ids(asset.regions, '区域')
+    for region in asset.regions:
         visibility = region.get('visibility', 'keeper')
-        if visibility not in {'public', 'keeper', 'roles'}:
+        if not isinstance(visibility, str) or visibility not in {
+            'public',
+            'keeper',
+            'roles',
+        }:
             raise ValueError('地图区域可见范围无效')
         if region.get('shape', 'rect') == 'rect':
             bounds = region.get('bounds', [])
             if not isinstance(bounds, (list, tuple)) or len(bounds) != 4:
                 raise ValueError('矩形区域需要四个 0 到 1 的归一化坐标')
-            if not all(
-                isinstance(value, (int, float)) and 0 <= value <= 1
-                for value in bounds
-            ):
+            if not all(_normalized_coordinate(value) for value in bounds):
                 raise ValueError('矩形区域需要四个 0 到 1 的归一化坐标')
             if bounds[0] >= bounds[2] or bounds[1] >= bounds[3]:
                 raise ValueError('矩形区域范围为空')
@@ -470,16 +487,53 @@ def _region_shapes(asset: ScenarioAsset) -> list[dict[str, Any]]:
             if any(
                 not isinstance(point, (list, tuple))
                 or len(point) != 2
-                or not all(
-                    isinstance(value, (int, float)) and 0 <= value <= 1
-                    for value in point
-                )
+                or not all(_normalized_coordinate(value) for value in point)
                 for point in points
             ):
                 raise ValueError('多边形区域需要归一化坐标顶点')
         else:
             raise ValueError('仅支持矩形和多边形地图区域')
     return asset.regions
+
+
+def _validate_map_annotations(asset: ScenarioAsset, scenario: Scenario):
+    node_ids = _annotation_ids(asset.nodes, '节点')
+    region_ids = _annotation_ids(asset.regions, '区域')
+    _region_shapes(asset)
+    references = {
+        'role_ids': {role.id for role in scenario.roles},
+        'scene_ids': {scene.id for scene in scenario.scenes},
+        'source_ids': {source.id for source in scenario.source_blocks},
+        'next_node_ids': node_ids,
+        'node_ids': node_ids,
+    }
+    for item in [asset.model_dump(), *asset.nodes, *asset.regions]:
+        visibility = item.get('visibility', 'keeper')
+        if not isinstance(visibility, str) or visibility not in {
+            'public',
+            'keeper',
+            'roles',
+        }:
+            raise ValueError('地图标注可见范围无效')
+        if visibility == 'roles' and not item.get('role_ids'):
+            raise ValueError('角色可见的地图标注须选择角色')
+        for key, allowed in references.items():
+            values = item.get(key, [])
+            if not isinstance(values, list) or any(
+                not isinstance(value, str) or value not in allowed
+                for value in values
+            ):
+                raise ValueError(f'地图标注的{key}引用无效')
+        region_id = item.get('region_id')
+        if region_id and (
+            not isinstance(region_id, str) or region_id not in region_ids
+        ):
+            raise ValueError('地图节点引用了不存在的区域')
+    for node in asset.nodes:
+        if not all(
+            _normalized_coordinate(node.get(key)) for key in ('x', 'y')
+        ):
+            raise ValueError('地图节点需要 0 到 1 的归一化坐标')
 
 
 class ScenarioService:
@@ -542,6 +596,56 @@ class ScenarioService:
         self._write_package(saved)
         self.store.put('scenario', saved.id, saved.model_dump(mode='json'))
         return saved
+
+    def update_map_annotations(
+        self,
+        scenario_id,
+        asset_id,
+        nodes,
+        regions,
+        *,
+        name=None,
+        caption=None,
+        is_map=None,
+        visibility=None,
+        role_ids=None,
+        scene_ids=None,
+        is_fog_enabled=None,
+    ) -> Scenario:
+        scenario = self.get(scenario_id)
+        asset = next(
+            (item for item in scenario.assets if item.id == asset_id), None
+        )
+        if asset is None or not asset.mime_type.startswith('image/'):
+            raise ValueError('所选素材不是模组中的图片')
+        updates = {'nodes': nodes, 'regions': regions}
+        for key, value in (
+            ('name', name),
+            ('caption', caption),
+            ('is_map', is_map),
+            ('visibility', visibility),
+            ('role_ids', role_ids),
+            ('scene_ids', scene_ids),
+            ('is_fog_enabled', is_fog_enabled),
+        ):
+            if value is not None:
+                updates[key] = value
+        if is_fog_enabled is None and (
+            asset.is_fog_enabled is True
+            or (asset.is_fog_enabled is None and asset.regions)
+        ):
+            updates['is_fog_enabled'] = True
+        changed = ScenarioAsset.model_validate(
+            {**asset.model_dump(), **updates}
+        )
+        if not changed.name.strip():
+            raise ValueError('图片名称不能为空')
+        _validate_map_annotations(changed, scenario)
+        scenario.assets = [
+            changed if item.id == asset_id else item
+            for item in scenario.assets
+        ]
+        return self.save(scenario)
 
     def approve(self, identity: str) -> Scenario:
         with self.store.transaction() as transaction:
@@ -1104,7 +1208,12 @@ class ScenarioService:
         source = safe_member_path(Path(scenario.directory), asset.path)
         if not source.is_file():
             raise FileNotFoundError('模组素材文件不存在')
-        if is_keeper or not asset.is_map or not asset.regions:
+        fog_enabled = (
+            bool(asset.regions)
+            if asset.is_fog_enabled is None
+            else asset.is_fog_enabled
+        )
+        if is_keeper or not asset.is_map or not fog_enabled:
             return source
         regions = _region_shapes(asset)
         revealed = set(revealed_regions or ())

@@ -163,6 +163,7 @@ class ScenarioAsset(Model):
     scene_ids: list[str] = Field(default_factory=list)
     caption: str = ''
     is_map: bool = False
+    is_fog_enabled: bool | None = None
     nodes: list[dict[str, Any]] = Field(default_factory=list)
     regions: list[dict[str, Any]] = Field(default_factory=list)
     source_ids: list[str] = Field(default_factory=list)
