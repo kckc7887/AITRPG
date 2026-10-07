@@ -42,6 +42,7 @@ class Provider(Entity):
     is_json_mode: bool = True
     is_tool_mode: bool = False
     is_vision: bool = False
+    thinking_mode: Literal['default', 'enabled', 'disabled'] = 'default'
 
 
 class Actor(Entity):
@@ -248,6 +249,7 @@ class Invitation(Entity):
     context: dict[str, Any] = Field(default_factory=dict)
     response: dict[str, Any] | None = None
     submission_id: str | None = None
+    response_fields: list[str] = Field(default_factory=list)
 
 
 class PlayerResponse(Model):
@@ -255,6 +257,7 @@ class PlayerResponse(Model):
     intent: str = Field(default='', max_length=4000)
     is_pass: bool = False
     defense: Literal['dodge', 'fight_back', 'cover'] | None = None
+    defense_weapon_index: int | None = Field(default=None, ge=0)
 
 
 class CheckRequest(Model):
@@ -265,9 +268,14 @@ class CheckRequest(Model):
     reason: str = ''
     is_private: bool = False
     is_pushed: bool = False
+    pushed_from_id: str | None = None
+    opponent_character_id: str | None = None
+    opponent_skill: str = ''
 
 
 class RuleCommand(Model):
+    id: str = Field(default_factory=new_id)
+    origin_command_id: str | None = None
     kind: str
     character_id: str = ''
     parameters: dict[str, Any] = Field(default_factory=dict)

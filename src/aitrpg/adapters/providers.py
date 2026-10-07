@@ -15,7 +15,9 @@ OUTPUT = TypeVar('OUTPUT', bound=BaseModel)
 
 
 class ProviderError(ValueError):
-    pass
+    def __init__(self, message, diagnostics=None):
+        super().__init__(message)
+        self.diagnostics = diagnostics or {}
 
 
 @dataclass
@@ -79,8 +81,29 @@ class ProviderClient:
                 return Generation(value=value, usage=total_usage)
             except (ValidationError, ValueError, TypeError) as error:
                 if attempt:
+                    diagnostics = {
+                        'finish_reason': data.get('stop_reason'),
+                        'usage': data.get('usage'),
+                        'error_type': type(error).__name__,
+                    }
+                    if provider.protocol == 'openai':
+                        choices = data.get('choices') or [{}]
+                        diagnostics['finish_reason'] = choices[0].get(
+                            'finish_reason'
+                        )
+                        message = choices[0].get('message', {})
+                        diagnostics['content_chars'] = len(
+                            message.get('content') or ''
+                        )
+                        diagnostics['reasoning_chars'] = len(
+                            message.get('reasoning_content') or ''
+                        )
+                    if isinstance(error, ValidationError):
+                        diagnostics['validation'] = error.errors(
+                            include_input=False
+                        )
                     raise ProviderError(
-                        '模型两次返回不合格的结构化结果'
+                        '模型两次返回不合格的结构化结果', diagnostics
                     ) from error
                 details = str(error).replace(secret, '[隐藏]')[:1200]
                 repair = (
@@ -166,6 +189,8 @@ class ProviderClient:
                     'type': 'tool',
                     'name': 'submit_result',
                 }
+        if provider.thinking_mode != 'default':
+            payload['thinking'] = {'type': provider.thinking_mode}
         async with httpx.AsyncClient(
             transport=self.transport, timeout=provider.timeout_seconds
         ) as client:
